@@ -1,3 +1,9 @@
+/// Called by a lower-level cache when it evicts a line, so upper-level caches
+/// can invalidate that line and maintain an inclusive hierarchy (e.g. L1 ⊆ L2).
+pub trait InvalidationListener {
+    fn invalidate_line(&self, base_addr: usize);
+}
+
 pub trait MemoryDevice {
     fn load_u8(&self, addr: usize) -> u8;
     fn store_u8(&self, addr: usize, n: u8);
@@ -19,7 +25,7 @@ pub trait MemoryDevice {
 }
 
 mod cache;
-pub use cache::{Cache, L1Cache, L2Cache};
+pub use cache::{Cache, L1Cache, L2Cache, L3Cache};
 
 mod main_memory;
 pub use main_memory::MainMemory;
