@@ -1,4 +1,6 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, rc::Rc};
+
+use crate::device::Clock;
 
 use super::{InvalidationListener, MemoryDevice};
 
@@ -11,12 +13,39 @@ struct CacheLine {
 
 type CacheSets = Box<[Box<[Option<CacheLine>]>]>;
 
+#[derive(Clone, Copy)]
+pub struct CacheTiming {
+    pub load_hit: u64,
+    pub load_miss: u64,
+    pub store_hit: u64,
+    pub store_miss: u64,
+    pub write_back: u64,
+    pub invalidation_send: u64,
+    pub invalidation_apply: u64,
+}
+
+impl Default for CacheTiming {
+    fn default() -> Self {
+        Self {
+            load_hit: 1,
+            load_miss: 4,
+            store_hit: 1,
+            store_miss: 4,
+            write_back: 2,
+            invalidation_send: 1,
+            invalidation_apply: 1,
+        }
+    }
+}
+
 pub struct Cache<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> {
     line_size: usize,
     num_sets: usize,
     cache: RefCell<CacheSets>,
     use_counter: RefCell<usize>,
     backing_memory: &'a M,
+    clock: Option<Rc<Clock>>,
+    timing: CacheTiming,
     invalidation_listener: RefCell<Option<&'a dyn InvalidationListener>>,
     /// Deferred invalidations to avoid re-entrant borrows when listener is called during a backing access.
     pending_invalidations: RefCell<Vec<usize>>,
@@ -39,9 +68,21 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
             cache: RefCell::new(cache),
             use_counter: RefCell::new(0),
             backing_memory,
+            clock: None,
+            timing: CacheTiming::default(),
             invalidation_listener: RefCell::new(None),
             pending_invalidations: RefCell::new(Vec::new()),
         }
+    }
+
+    pub fn with_clock(mut self, clock: Rc<Clock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    pub fn with_timing(mut self, timing: CacheTiming) -> Self {
+        self.timing = timing;
+        self
     }
 
     /// Registers a listener for inclusive hierarchies. When this cache evicts a line,
@@ -71,6 +112,12 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
         let v = *c;
         *c = c.saturating_add(1);
         v
+    }
+
+    fn tick(&self, n: u64) {
+        if let Some(clock) = &self.clock {
+            clock.advance(n);
+        }
     }
 
     fn fill_line_from_backing(&self, base_addr: usize, last_used: usize) -> CacheLine {
@@ -123,6 +170,7 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
                     break;
                 }
             }
+            self.tick(self.timing.invalidation_apply);
         }
     }
 }
@@ -143,6 +191,7 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
                 && l.base_addr == base
             {
                 set[way].as_mut().unwrap().last_used = use_count;
+                self.tick(self.timing.load_hit);
                 return set[way].as_ref().unwrap().data[offset];
             }
         }
@@ -153,6 +202,7 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
             && old.dirty
         {
             self.write_back_line(old);
+            self.tick(self.timing.write_back);
         }
         let mut new_line = self.fill_line_from_backing(base, use_count);
         let byte = new_line.data[offset];
@@ -162,7 +212,9 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
             && let Some(listener) = self.invalidation_listener.borrow().as_ref()
         {
             listener.invalidate_line(addr);
+            self.tick(self.timing.invalidation_send);
         }
+        self.tick(self.timing.load_miss);
         byte
     }
 
@@ -183,6 +235,7 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
                 set[way].as_mut().unwrap().data[offset] = n;
                 set[way].as_mut().unwrap().dirty = true;
                 set[way].as_mut().unwrap().last_used = use_count;
+                self.tick(self.timing.store_hit);
                 return;
             }
         }
@@ -193,6 +246,7 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
             && old.dirty
         {
             self.write_back_line(old);
+            self.tick(self.timing.write_back);
         }
         let mut new_line = self.fill_line_from_backing(base, use_count);
         new_line.data[offset] = n;
@@ -203,7 +257,9 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
             && let Some(listener) = self.invalidation_listener.borrow().as_ref()
         {
             listener.invalidate_line(addr);
+            self.tick(self.timing.invalidation_send);
         }
+        self.tick(self.timing.store_miss);
     }
 
     fn load_u16(&self, addr: usize) -> u16 {
@@ -271,9 +327,13 @@ pub type L3Cache<'a, M> = Cache<'a, 16, M>;
 
 #[cfg(test)]
 mod tests {
-    use super::super::MainMemory;
+    use std::rc::Rc;
+
+    use crate::device::Clock;
+
     use super::super::MemoryDevice;
-    use super::{Cache, L1Cache, L2Cache, L3Cache};
+    use super::super::{MainMemory, MainMemoryTiming};
+    use super::{Cache, CacheTiming, L1Cache, L2Cache, L3Cache};
 
     #[test]
     fn test_l1_load_store_hit() {
@@ -455,5 +515,34 @@ mod tests {
         l3.store_u8(0, 200);
         assert_eq!(l3.load_u8(0), 200);
         assert_eq!(mem.load_u8(0), 100);
+    }
+
+    #[test]
+    fn test_cache_timing_advances_clock() {
+        let clock = Rc::new(Clock::new());
+        let mem = MainMemory::new(8)
+            .with_clock(clock.clone())
+            .with_timing(MainMemoryTiming {
+                load: 20,
+                store: 30,
+            });
+        let cache: Cache<'_, 1, _> = Cache::new(1, 1, &mem)
+            .with_clock(clock.clone())
+            .with_timing(CacheTiming {
+                load_hit: 1,
+                load_miss: 3,
+                store_hit: 2,
+                store_miss: 4,
+                write_back: 5,
+                invalidation_send: 7,
+                invalidation_apply: 11,
+            });
+
+        cache.load_u8(0); // miss: 3 + mem load 20
+        cache.load_u8(0); // hit: 1
+        cache.store_u8(0, 9); // hit: 2
+        cache.load_u8(1); // miss with dirty eviction: 5 + 30 + 3 + 20
+
+        assert_eq!(clock.curr_tick(), 84);
     }
 }

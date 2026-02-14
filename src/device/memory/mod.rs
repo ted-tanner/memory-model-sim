@@ -25,7 +25,7 @@ pub trait MemoryDevice {
 }
 
 mod cache;
-pub use cache::{Cache, L1Cache, L2Cache, L3Cache};
+pub use cache::{Cache, CacheTiming, L1Cache, L2Cache, L3Cache};
 
 mod main_memory;
-pub use main_memory::MainMemory;
+pub use main_memory::{MainMemory, MainMemoryTiming};
