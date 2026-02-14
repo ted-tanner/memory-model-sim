@@ -1,9 +1,9 @@
 use crate::{
-    device::{Clock, MainMemory},
+    device::{Clock, memory::MainMemory},
     program::Program,
 };
 
-// TODO: Read a file in main that defines the machine (e.g. how much RAM, which caches, register names, etc)
+// TODO: Read a file in main that defines the machine (e.g. how much RAM, which caches, register names, builtin function calls, etc)
 pub struct Machine {
     clock: Clock,
     memory: MainMemory,
