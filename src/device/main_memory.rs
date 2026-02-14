@@ -34,7 +34,7 @@ impl MainMemory {
         self.buf.borrow_mut()[start..end].copy_from_slice(buf);
     }
 }
-    
+
 #[cfg(test)]
 mod tests {
     use super::MainMemory;

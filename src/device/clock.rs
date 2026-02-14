@@ -54,4 +54,3 @@ mod tests {
         assert_eq!(clock.curr_tick(), 10);
     }
 }
-
