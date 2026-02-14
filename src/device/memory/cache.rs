@@ -47,8 +47,6 @@ pub struct Cache<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> {
     clock: Option<Rc<Clock>>,
     timing: CacheTiming,
     invalidation_listener: RefCell<Option<&'a dyn InvalidationListener>>,
-    /// Deferred invalidations to avoid re-entrant borrows when listener is called during a backing access.
-    pending_invalidations: RefCell<Vec<usize>>,
 }
 
 impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M> {
@@ -74,7 +72,6 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
             clock: None,
             timing: CacheTiming::default(),
             invalidation_listener: RefCell::new(None),
-            pending_invalidations: RefCell::new(Vec::new()),
         }
     }
 
@@ -162,67 +159,51 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
         empty.unwrap_or(lru_way)
     }
 
-    fn apply_pending_invalidations(&self, cache: &mut CacheSets) {
-        let addrs = std::mem::take(&mut *self.pending_invalidations.borrow_mut());
-        for base_addr in addrs {
-            let set_idx = self.set_index(base_addr);
-            let set = &mut cache[set_idx];
-            for way in 0..ASSOCIATIVITY {
-                if set[way].as_ref().is_some_and(|l| l.base_addr == base_addr) {
-                    if let Some(ref line) = set[way]
-                        && line.dirty
-                    {
-                        self.write_back_line(line);
-                        self.tick(self.timing.write_back);
-                    }
-                    set[way] = None;
-                    // Charge invalidation cost only when an actual line is invalidated.
-                    self.tick(self.timing.invalidation_apply);
-                    break;
-                }
-            }
-        }
-    }
-
     fn load_u8_internal(&self, addr: usize, charge_access_timing: bool) -> u8 {
         let set_idx = self.set_index(addr);
         let base = self.line_base(addr);
         let offset = self.offset_in_line(addr);
         let use_count = self.next_use_counter();
 
-        let mut cache = self.cache.borrow_mut();
-        self.apply_pending_invalidations(&mut cache);
-        let set = &mut cache[set_idx];
+        let (victim_way, evicted_line) = {
+            let mut cache = self.cache.borrow_mut();
+            let set = &mut cache[set_idx];
 
-        for way in 0..ASSOCIATIVITY {
-            if let Some(ref l) = set[way]
-                && l.base_addr == base
-            {
-                set[way].as_mut().unwrap().last_used = use_count;
-                if charge_access_timing {
-                    self.tick(self.timing.load_hit);
+            for way in 0..ASSOCIATIVITY {
+                if let Some(ref l) = set[way]
+                    && l.base_addr == base
+                {
+                    set[way].as_mut().unwrap().last_used = use_count;
+                    if charge_access_timing {
+                        self.tick(self.timing.load_hit);
+                    }
+                    return set[way].as_ref().unwrap().data[offset];
                 }
-                return set[way].as_ref().unwrap().data[offset];
             }
-        }
 
-        let victim_way = self.find_victim(set);
-        let evicted_base = set[victim_way].as_ref().map(|l| l.base_addr);
-        if let Some(ref old) = set[victim_way]
+            let victim_way = self.find_victim(set);
+            let evicted_line = set[victim_way].take();
+            (victim_way, evicted_line)
+        };
+
+        if let Some(ref old) = evicted_line
             && old.dirty
         {
             self.write_back_line(old);
             self.tick(self.timing.write_back);
         }
-        let new_line = self.fill_line_from_backing(base, use_count);
-        let byte = new_line.data[offset];
-        set[victim_way] = Some(new_line);
-        drop(cache);
-        if let Some(addr) = evicted_base
+        if let Some(addr) = evicted_line.as_ref().map(|l| l.base_addr)
             && let Some(listener) = self.invalidation_listener.borrow().as_ref()
         {
             listener.invalidate_line(addr);
             self.tick(self.timing.invalidation_send);
+        }
+
+        let new_line = self.fill_line_from_backing(base, use_count);
+        let byte = new_line.data[offset];
+        {
+            let mut cache = self.cache.borrow_mut();
+            cache[set_idx][victim_way] = Some(new_line);
         }
         if charge_access_timing {
             self.tick(self.timing.load_miss);
@@ -236,42 +217,48 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
         let offset = self.offset_in_line(addr);
         let use_count = self.next_use_counter();
 
-        let mut cache = self.cache.borrow_mut();
-        self.apply_pending_invalidations(&mut cache);
-        let set = &mut cache[set_idx];
+        let (victim_way, evicted_line) = {
+            let mut cache = self.cache.borrow_mut();
+            let set = &mut cache[set_idx];
 
-        for way in 0..ASSOCIATIVITY {
-            if let Some(ref l) = set[way]
-                && l.base_addr == base
-            {
-                set[way].as_mut().unwrap().data[offset] = n;
-                set[way].as_mut().unwrap().dirty = true;
-                set[way].as_mut().unwrap().last_used = use_count;
-                if charge_access_timing {
-                    self.tick(self.timing.store_hit);
+            for way in 0..ASSOCIATIVITY {
+                if let Some(ref l) = set[way]
+                    && l.base_addr == base
+                {
+                    set[way].as_mut().unwrap().data[offset] = n;
+                    set[way].as_mut().unwrap().dirty = true;
+                    set[way].as_mut().unwrap().last_used = use_count;
+                    if charge_access_timing {
+                        self.tick(self.timing.store_hit);
+                    }
+                    return;
                 }
-                return;
             }
-        }
 
-        let victim_way = self.find_victim(set);
-        let evicted_base = set[victim_way].as_ref().map(|l| l.base_addr);
-        if let Some(ref old) = set[victim_way]
+            let victim_way = self.find_victim(set);
+            let evicted_line = set[victim_way].take();
+            (victim_way, evicted_line)
+        };
+
+        if let Some(ref old) = evicted_line
             && old.dirty
         {
             self.write_back_line(old);
             self.tick(self.timing.write_back);
         }
-        let mut new_line = self.fill_line_from_backing(base, use_count);
-        new_line.data[offset] = n;
-        new_line.dirty = true;
-        set[victim_way] = Some(new_line);
-        drop(cache);
-        if let Some(addr) = evicted_base
+        if let Some(addr) = evicted_line.as_ref().map(|l| l.base_addr)
             && let Some(listener) = self.invalidation_listener.borrow().as_ref()
         {
             listener.invalidate_line(addr);
             self.tick(self.timing.invalidation_send);
+        }
+
+        let mut new_line = self.fill_line_from_backing(base, use_count);
+        new_line.data[offset] = n;
+        new_line.dirty = true;
+        {
+            let mut cache = self.cache.borrow_mut();
+            cache[set_idx][victim_way] = Some(new_line);
         }
         if charge_access_timing {
             self.tick(self.timing.store_miss);
@@ -367,7 +354,27 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> InvalidationListener
     for Cache<'a, ASSOCIATIVITY, M>
 {
     fn invalidate_line(&self, base_addr: usize) {
-        self.pending_invalidations.borrow_mut().push(base_addr);
+        let set_idx = self.set_index(base_addr);
+        let removed_line = {
+            let mut cache = self.cache.borrow_mut();
+            let set = &mut cache[set_idx];
+            let mut removed = None;
+            for way in 0..ASSOCIATIVITY {
+                if set[way].as_ref().is_some_and(|l| l.base_addr == base_addr) {
+                    removed = set[way].take();
+                    break;
+                }
+            }
+            removed
+        };
+
+        if let Some(line) = removed_line {
+            if line.dirty {
+                self.write_back_line(&line);
+                self.tick(self.timing.write_back);
+            }
+            self.tick(self.timing.invalidation_apply);
+        }
     }
 }
 
@@ -608,6 +615,20 @@ mod tests {
         // Applying pending invalidations should flush dirty line 0.
         let _ = cache.load_u8(1);
         assert_eq!(mem.load_u8(0), 77);
+    }
+
+    #[test]
+    fn test_dirty_line_writeback_on_invalidation_is_immediate() {
+        let mem = MainMemory::new(16);
+        let cache: Cache<'_, 1, _> = Cache::new(1, 1, &mem);
+
+        cache.load_u8(0);
+        cache.store_u8(0, 99);
+        cache.invalidate_line(0);
+
+        // Immediate invalidation should flush dirty line without requiring another access.
+        assert_eq!(mem.load_u8(0), 99);
+        assert_eq!(cache.load_u8(0), 99);
     }
 
     #[test]

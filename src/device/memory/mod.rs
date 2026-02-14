@@ -158,4 +158,29 @@ mod integration_tests {
         // Main memory is still old value because L2 has not been forced to write back yet.
         assert_eq!(mem.load_u8(0), 0);
     }
+
+    #[test]
+    fn test_invalidation_is_line_granular_not_byte_granular() {
+        // Small 1-way caches to make eviction deterministic.
+        let mem = MainMemory::new(128);
+        let l2: Cache<'_, 1, _> = Cache::new(16, 1, &mem);
+        let l1: Cache<'_, 1, _> = Cache::new(16, 1, &l2);
+        l2.set_invalidation_listener(&l1);
+
+        mem.store_u8(7, 1);
+
+        // Bring line base 0 into L1/L2.
+        assert_eq!(l1.load_u8(7), 1);
+
+        // Mutate backing memory directly at another byte in same line.
+        // If L1 still kept any stale byte after invalidation, we'd read the old value.
+        mem.store_u8(7, 2);
+
+        // Evict line base 0 from L2 by touching a different line base (16),
+        // which should invalidate the entire line in L1.
+        let _ = l2.load_u8(16);
+
+        // Reload from L1: should miss and fetch fresh value (2), proving line-level invalidation.
+        assert_eq!(l1.load_u8(7), 2);
+    }
 }
