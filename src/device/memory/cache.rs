@@ -53,6 +53,9 @@ pub struct Cache<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> {
 
 impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M> {
     pub fn new(line_size: usize, num_sets: usize, backing_memory: &'a M) -> Self {
+        debug_assert!(ASSOCIATIVITY > 0, "cache associativity must be > 0");
+        debug_assert!(line_size > 0, "cache line_size must be > 0");
+        debug_assert!(num_sets > 0, "cache num_sets must be > 0");
         let cache: CacheSets = (0..num_sets)
             .map(|_| {
                 (0..ASSOCIATIVITY)
@@ -166,17 +169,22 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
             let set = &mut cache[set_idx];
             for way in 0..ASSOCIATIVITY {
                 if set[way].as_ref().is_some_and(|l| l.base_addr == base_addr) {
+                    if let Some(ref line) = set[way]
+                        && line.dirty
+                    {
+                        self.write_back_line(line);
+                        self.tick(self.timing.write_back);
+                    }
                     set[way] = None;
+                    // Charge invalidation cost only when an actual line is invalidated.
+                    self.tick(self.timing.invalidation_apply);
                     break;
                 }
             }
-            self.tick(self.timing.invalidation_apply);
         }
     }
-}
 
-impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a, ASSOCIATIVITY, M> {
-    fn load_u8(&self, addr: usize) -> u8 {
+    fn load_u8_internal(&self, addr: usize, charge_access_timing: bool) -> u8 {
         let set_idx = self.set_index(addr);
         let base = self.line_base(addr);
         let offset = self.offset_in_line(addr);
@@ -191,7 +199,9 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
                 && l.base_addr == base
             {
                 set[way].as_mut().unwrap().last_used = use_count;
-                self.tick(self.timing.load_hit);
+                if charge_access_timing {
+                    self.tick(self.timing.load_hit);
+                }
                 return set[way].as_ref().unwrap().data[offset];
             }
         }
@@ -204,7 +214,7 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
             self.write_back_line(old);
             self.tick(self.timing.write_back);
         }
-        let mut new_line = self.fill_line_from_backing(base, use_count);
+        let new_line = self.fill_line_from_backing(base, use_count);
         let byte = new_line.data[offset];
         set[victim_way] = Some(new_line);
         drop(cache);
@@ -214,11 +224,13 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
             listener.invalidate_line(addr);
             self.tick(self.timing.invalidation_send);
         }
-        self.tick(self.timing.load_miss);
+        if charge_access_timing {
+            self.tick(self.timing.load_miss);
+        }
         byte
     }
 
-    fn store_u8(&self, addr: usize, n: u8) {
+    fn store_u8_internal(&self, addr: usize, n: u8, charge_access_timing: bool) {
         let set_idx = self.set_index(addr);
         let base = self.line_base(addr);
         let offset = self.offset_in_line(addr);
@@ -235,7 +247,9 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
                 set[way].as_mut().unwrap().data[offset] = n;
                 set[way].as_mut().unwrap().dirty = true;
                 set[way].as_mut().unwrap().last_used = use_count;
-                self.tick(self.timing.store_hit);
+                if charge_access_timing {
+                    self.tick(self.timing.store_hit);
+                }
                 return;
             }
         }
@@ -259,33 +273,69 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
             listener.invalidate_line(addr);
             self.tick(self.timing.invalidation_send);
         }
-        self.tick(self.timing.store_miss);
+        if charge_access_timing {
+            self.tick(self.timing.store_miss);
+        }
+    }
+}
+
+impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a, ASSOCIATIVITY, M> {
+    fn load_u8(&self, addr: usize) -> u8 {
+        self.load_u8_internal(addr, true)
+    }
+
+    fn store_u8(&self, addr: usize, n: u8) {
+        self.store_u8_internal(addr, n, true);
     }
 
     fn load_u16(&self, addr: usize) -> u16 {
-        let lo = self.load_u8(addr) as u16;
-        let hi = self.load_u8(addr + 1) as u16;
+        let lo = self.load_u8_internal(addr, true) as u16;
+        let hi = self.load_u8_internal(addr + 1, self.line_base(addr + 1) != self.line_base(addr))
+            as u16;
         lo | (hi << 8)
     }
 
     fn store_u16(&self, addr: usize, n: u16) {
-        self.store_u8(addr, n as u8);
-        self.store_u8(addr + 1, (n >> 8) as u8);
+        self.store_u8_internal(addr, n as u8, true);
+        self.store_u8_internal(
+            addr + 1,
+            (n >> 8) as u8,
+            self.line_base(addr + 1) != self.line_base(addr),
+        );
     }
 
     fn load_u32(&self, addr: usize) -> u32 {
-        let b0 = self.load_u8(addr) as u32;
-        let b1 = self.load_u8(addr + 1) as u32;
-        let b2 = self.load_u8(addr + 2) as u32;
-        let b3 = self.load_u8(addr + 3) as u32;
+        let b0 = self.load_u8_internal(addr, true) as u32;
+        let b1 = self.load_u8_internal(addr + 1, self.line_base(addr + 1) != self.line_base(addr))
+            as u32;
+        let b2 = self.load_u8_internal(
+            addr + 2,
+            self.line_base(addr + 2) != self.line_base(addr + 1),
+        ) as u32;
+        let b3 = self.load_u8_internal(
+            addr + 3,
+            self.line_base(addr + 3) != self.line_base(addr + 2),
+        ) as u32;
         b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
     }
 
     fn store_u32(&self, addr: usize, n: u32) {
-        self.store_u8(addr, n as u8);
-        self.store_u8(addr + 1, (n >> 8) as u8);
-        self.store_u8(addr + 2, (n >> 16) as u8);
-        self.store_u8(addr + 3, (n >> 24) as u8);
+        self.store_u8_internal(addr, n as u8, true);
+        self.store_u8_internal(
+            addr + 1,
+            (n >> 8) as u8,
+            self.line_base(addr + 1) != self.line_base(addr),
+        );
+        self.store_u8_internal(
+            addr + 2,
+            (n >> 16) as u8,
+            self.line_base(addr + 2) != self.line_base(addr + 1),
+        );
+        self.store_u8_internal(
+            addr + 3,
+            (n >> 24) as u8,
+            self.line_base(addr + 3) != self.line_base(addr + 2),
+        );
     }
 
     fn load_i8(&self, addr: usize) -> i8 {
@@ -331,7 +381,7 @@ mod tests {
 
     use crate::device::Clock;
 
-    use super::super::MemoryDevice;
+    use super::super::{InvalidationListener, MemoryDevice};
     use super::super::{MainMemory, MainMemoryTiming};
     use super::{Cache, CacheTiming, L1Cache, L2Cache, L3Cache};
 
@@ -544,5 +594,70 @@ mod tests {
         cache.load_u8(1); // miss with dirty eviction: 5 + 30 + 3 + 20
 
         assert_eq!(clock.curr_tick(), 84);
+    }
+
+    #[test]
+    fn test_dirty_line_writeback_on_invalidation_apply() {
+        let mem = MainMemory::new(16);
+        let cache: Cache<'_, 1, _> = Cache::new(1, 1, &mem);
+
+        cache.load_u8(0);
+        cache.store_u8(0, 77);
+        cache.invalidate_line(0);
+
+        // Applying pending invalidations should flush dirty line 0.
+        let _ = cache.load_u8(1);
+        assert_eq!(mem.load_u8(0), 77);
+    }
+
+    #[test]
+    fn test_u32_timing_charged_per_line_not_per_byte() {
+        let clock = Rc::new(Clock::new());
+        let mem = MainMemory::new(32)
+            .with_clock(clock.clone())
+            .with_timing(MainMemoryTiming { load: 0, store: 0 });
+        let cache: Cache<'_, 2, _> = Cache::new(8, 1, &mem)
+            .with_clock(clock.clone())
+            .with_timing(CacheTiming {
+                load_hit: 2,
+                load_miss: 5,
+                store_hit: 0,
+                store_miss: 0,
+                write_back: 0,
+                invalidation_send: 0,
+                invalidation_apply: 0,
+            });
+
+        // Cold same-line u32 read should charge one miss.
+        let _ = cache.load_u32(0);
+        assert_eq!(clock.curr_tick(), 5);
+
+        // Warm same-line u32 read should charge one hit.
+        let _ = cache.load_u32(0);
+        assert_eq!(clock.curr_tick(), 7);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "cache line_size must be > 0")]
+    fn test_debug_assert_line_size_zero() {
+        let mem = MainMemory::new(8);
+        let _cache: Cache<'_, 1, _> = Cache::new(0, 1, &mem);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "cache num_sets must be > 0")]
+    fn test_debug_assert_num_sets_zero() {
+        let mem = MainMemory::new(8);
+        let _cache: Cache<'_, 1, _> = Cache::new(1, 0, &mem);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "cache associativity must be > 0")]
+    fn test_debug_assert_associativity_zero() {
+        let mem = MainMemory::new(8);
+        let _cache: Cache<'_, 0, _> = Cache::new(1, 1, &mem);
     }
 }
