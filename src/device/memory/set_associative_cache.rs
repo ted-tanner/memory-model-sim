@@ -38,25 +38,31 @@ impl Default for CacheTiming {
     }
 }
 
-pub struct Cache<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> {
+pub struct SetAssociativeCache<'a> {
     line_size: usize,
     num_sets: usize,
+    associativity: usize,
     cache: RefCell<CacheSets>,
     use_counter: RefCell<usize>,
-    backing_memory: &'a M,
+    backing_memory: &'a dyn MemoryDevice,
     clock: Option<Rc<Clock>>,
     timing: CacheTiming,
     invalidation_listener: RefCell<Option<&'a dyn InvalidationListener>>,
 }
 
-impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M> {
-    pub fn new(line_size: usize, num_sets: usize, backing_memory: &'a M) -> Self {
-        debug_assert!(ASSOCIATIVITY > 0, "cache associativity must be > 0");
+impl<'a> SetAssociativeCache<'a> {
+    pub fn new(
+        line_size: usize,
+        num_sets: usize,
+        associativity: usize,
+        backing_memory: &'a dyn MemoryDevice,
+    ) -> Self {
+        debug_assert!(associativity > 0, "cache associativity must be > 0");
         debug_assert!(line_size > 0, "cache line_size must be > 0");
         debug_assert!(num_sets > 0, "cache num_sets must be > 0");
         let cache: CacheSets = (0..num_sets)
             .map(|_| {
-                (0..ASSOCIATIVITY)
+                (0..associativity)
                     .map(|_| None)
                     .collect::<Vec<_>>()
                     .into_boxed_slice()
@@ -66,6 +72,7 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
         Self {
             line_size,
             num_sets,
+            associativity,
             cache: RefCell::new(cache),
             use_counter: RefCell::new(0),
             backing_memory,
@@ -169,7 +176,7 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
             let mut cache = self.cache.borrow_mut();
             let set = &mut cache[set_idx];
 
-            for way in 0..ASSOCIATIVITY {
+            for way in 0..self.associativity {
                 if let Some(ref l) = set[way]
                     && l.base_addr == base
                 {
@@ -221,7 +228,7 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
             let mut cache = self.cache.borrow_mut();
             let set = &mut cache[set_idx];
 
-            for way in 0..ASSOCIATIVITY {
+            for way in 0..self.associativity {
                 if let Some(ref l) = set[way]
                     && l.base_addr == base
                 {
@@ -266,7 +273,7 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> Cache<'a, ASSOCIATIVITY, M
     }
 }
 
-impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a, ASSOCIATIVITY, M> {
+impl<'a> MemoryDevice for SetAssociativeCache<'a> {
     fn load_u8(&self, addr: usize) -> u8 {
         self.load_u8_internal(addr, true)
     }
@@ -350,16 +357,14 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> MemoryDevice for Cache<'a,
     }
 }
 
-impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> InvalidationListener
-    for Cache<'a, ASSOCIATIVITY, M>
-{
+impl<'a> InvalidationListener for SetAssociativeCache<'a> {
     fn invalidate_line(&self, base_addr: usize) {
         let set_idx = self.set_index(base_addr);
         let removed_line = {
             let mut cache = self.cache.borrow_mut();
             let set = &mut cache[set_idx];
             let mut removed = None;
-            for way in 0..ASSOCIATIVITY {
+            for way in 0..self.associativity {
                 if set[way].as_ref().is_some_and(|l| l.base_addr == base_addr) {
                     removed = set[way].take();
                     break;
@@ -378,10 +383,6 @@ impl<'a, const ASSOCIATIVITY: usize, M: MemoryDevice> InvalidationListener
     }
 }
 
-pub type L1Cache<'a, M> = Cache<'a, 4, M>;
-pub type L2Cache<'a, M> = Cache<'a, 8, M>;
-pub type L3Cache<'a, M> = Cache<'a, 16, M>;
-
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
@@ -390,7 +391,7 @@ mod tests {
 
     use super::super::{InvalidationListener, MemoryDevice};
     use super::super::{MainMemory, MainMemoryTiming};
-    use super::{Cache, CacheTiming, L1Cache, L2Cache, L3Cache};
+    use super::{CacheTiming, SetAssociativeCache};
 
     #[test]
     fn test_l1_load_store_hit() {
@@ -398,7 +399,7 @@ mod tests {
         mem.store_u8(10, 42);
         mem.store_u8(11, 43);
 
-        let cache = L1Cache::new(16, 1, &mem);
+        let cache = SetAssociativeCache::new(16, 1, 4, &mem);
 
         assert_eq!(cache.load_u8(10), 42);
         assert_eq!(cache.load_u8(11), 43);
@@ -416,7 +417,7 @@ mod tests {
         mem.store_u8(64, 4);
         mem.store_u8(128, 5);
 
-        let cache = L1Cache::new(16, 1, &mem);
+        let cache = SetAssociativeCache::new(16, 1, 4, &mem);
         assert_eq!(cache.load_u8(0), 1);
         cache.store_u8(0, 10);
         assert_eq!(cache.load_u8(16), 2);
@@ -434,7 +435,7 @@ mod tests {
         mem.store_u32(0, 0xDEAD_BEEF);
         mem.store_u32(8, 0xCAFE_BABE);
 
-        let cache = L1Cache::new(32, 1, &mem);
+        let cache = SetAssociativeCache::new(32, 1, 4, &mem);
         assert_eq!(cache.load_u32(0), 0xDEAD_BEEF);
         assert_eq!(cache.load_u32(8), 0xCAFE_BABE);
         cache.store_u32(0, 0xCAFE_BABE);
@@ -454,7 +455,7 @@ mod tests {
         mem.store_i32(0, neg_hex);
         mem.store_i16(8, -42);
 
-        let cache = L1Cache::new(32, 1, &mem);
+        let cache = SetAssociativeCache::new(32, 1, 4, &mem);
         assert_eq!(cache.load_i32(0), neg_hex);
         assert_eq!(cache.load_i16(8), -42);
         cache.store_i32(0, i32::MAX);
@@ -473,7 +474,7 @@ mod tests {
         mem.store_u8(10, 42);
         mem.store_u8(11, 43);
 
-        let cache = L2Cache::new(16, 4, &mem);
+        let cache = SetAssociativeCache::new(16, 4, 8, &mem);
         assert_eq!(cache.load_u8(10), 42);
         assert_eq!(cache.load_u8(11), 43);
         cache.store_u8(10, 100);
@@ -488,7 +489,7 @@ mod tests {
             mem.store_u8(addr, i as u8 + 1);
         }
 
-        let cache = L2Cache::new(16, 2, &mem);
+        let cache = SetAssociativeCache::new(16, 2, 8, &mem);
         assert_eq!(cache.load_u8(0), 1);
         cache.store_u8(0, 10);
         for &addr in &[32, 64, 96, 128, 160, 192, 224] {
@@ -507,7 +508,7 @@ mod tests {
         }
         mem.store_u8(128, 9);
 
-        let cache = L2Cache::new(16, 1, &mem);
+        let cache = SetAssociativeCache::new(16, 1, 8, &mem);
         assert_eq!(cache.load_u8(0), 1);
         cache.store_u8(0, 10);
         for addr in (16..128).step_by(16) {
@@ -527,7 +528,7 @@ mod tests {
         mem.store_u8(16, 2);
         mem.store_u8(32, 3);
 
-        let cache: Cache<'_, 2, _> = Cache::new(16, 1, &mem);
+        let cache: SetAssociativeCache<'_> = SetAssociativeCache::new(16, 1, 2, &mem);
         assert_eq!(cache.load_u8(0), 1);
         cache.store_u8(0, 10);
         assert_eq!(cache.load_u8(16), 2);
@@ -544,8 +545,8 @@ mod tests {
             mem.store_u8(addr, 2);
         }
 
-        let l2 = L2Cache::new(16, 1, &mem);
-        let l1: Cache<'_, 8, _> = Cache::new(16, 1, &l2);
+        let l2 = SetAssociativeCache::new(16, 1, 8, &mem);
+        let l1: SetAssociativeCache<'_> = SetAssociativeCache::new(16, 1, 8, &l2);
         l2.set_invalidation_listener(&l1);
 
         assert_eq!(l1.load_u8(0), 1);
@@ -566,7 +567,7 @@ mod tests {
         mem.store_u8(0, 100);
         mem.store_u32(64, 0xDEAD_BEEF);
 
-        let l3 = L3Cache::new(64, 4, &mem);
+        let l3 = SetAssociativeCache::new(64, 4, 16, &mem);
         assert_eq!(l3.load_u8(0), 100);
         assert_eq!(l3.load_u32(64), 0xDEAD_BEEF);
         l3.store_u8(0, 200);
@@ -583,7 +584,7 @@ mod tests {
                 load: 20,
                 store: 30,
             });
-        let cache: Cache<'_, 1, _> = Cache::new(1, 1, &mem)
+        let cache: SetAssociativeCache<'_> = SetAssociativeCache::new(1, 1, 1, &mem)
             .with_clock(clock.clone())
             .with_timing(CacheTiming {
                 load_hit: 1,
@@ -606,13 +607,13 @@ mod tests {
     #[test]
     fn test_dirty_line_writeback_on_invalidation_apply() {
         let mem = MainMemory::new(16);
-        let cache: Cache<'_, 1, _> = Cache::new(1, 1, &mem);
+        let cache: SetAssociativeCache<'_> = SetAssociativeCache::new(1, 1, 1, &mem);
 
         cache.load_u8(0);
         cache.store_u8(0, 77);
         cache.invalidate_line(0);
 
-        // Applying pending invalidations should flush dirty line 0.
+        // Dirty line 0 is flushed during immediate invalidation.
         let _ = cache.load_u8(1);
         assert_eq!(mem.load_u8(0), 77);
     }
@@ -620,7 +621,7 @@ mod tests {
     #[test]
     fn test_dirty_line_writeback_on_invalidation_is_immediate() {
         let mem = MainMemory::new(16);
-        let cache: Cache<'_, 1, _> = Cache::new(1, 1, &mem);
+        let cache: SetAssociativeCache<'_> = SetAssociativeCache::new(1, 1, 1, &mem);
 
         cache.load_u8(0);
         cache.store_u8(0, 99);
@@ -637,7 +638,7 @@ mod tests {
         let mem = MainMemory::new(32)
             .with_clock(clock.clone())
             .with_timing(MainMemoryTiming { load: 0, store: 0 });
-        let cache: Cache<'_, 2, _> = Cache::new(8, 1, &mem)
+        let cache: SetAssociativeCache<'_> = SetAssociativeCache::new(8, 1, 2, &mem)
             .with_clock(clock.clone())
             .with_timing(CacheTiming {
                 load_hit: 2,
@@ -663,7 +664,7 @@ mod tests {
     #[should_panic(expected = "cache line_size must be > 0")]
     fn test_debug_assert_line_size_zero() {
         let mem = MainMemory::new(8);
-        let _cache: Cache<'_, 1, _> = Cache::new(0, 1, &mem);
+        let _cache: SetAssociativeCache<'_> = SetAssociativeCache::new(0, 1, 1, &mem);
     }
 
     #[cfg(debug_assertions)]
@@ -671,7 +672,7 @@ mod tests {
     #[should_panic(expected = "cache num_sets must be > 0")]
     fn test_debug_assert_num_sets_zero() {
         let mem = MainMemory::new(8);
-        let _cache: Cache<'_, 1, _> = Cache::new(1, 0, &mem);
+        let _cache: SetAssociativeCache<'_> = SetAssociativeCache::new(1, 0, 1, &mem);
     }
 
     #[cfg(debug_assertions)]
@@ -679,6 +680,6 @@ mod tests {
     #[should_panic(expected = "cache associativity must be > 0")]
     fn test_debug_assert_associativity_zero() {
         let mem = MainMemory::new(8);
-        let _cache: Cache<'_, 0, _> = Cache::new(1, 1, &mem);
+        let _cache: SetAssociativeCache<'_> = SetAssociativeCache::new(1, 1, 0, &mem);
     }
 }

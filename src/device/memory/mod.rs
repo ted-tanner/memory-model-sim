@@ -24,8 +24,8 @@ pub trait MemoryDevice {
     fn store_i32(&self, addr: usize, n: i32);
 }
 
-mod cache;
-pub use cache::{Cache, CacheTiming, L1Cache, L2Cache, L3Cache};
+mod set_associative_cache;
+pub use set_associative_cache::{CacheTiming, SetAssociativeCache};
 
 mod main_memory;
 pub use main_memory::{MainMemory, MainMemoryTiming};
@@ -41,9 +41,9 @@ mod integration_tests {
     #[test]
     fn test_three_level_writeback_eventually_reaches_main_memory() {
         let mem = MainMemory::new(1024);
-        let l3 = L3Cache::new(1, 1, &mem);
-        let l2 = L2Cache::new(1, 1, &l3);
-        let l1 = L1Cache::new(1, 1, &l2);
+        let l3 = SetAssociativeCache::new(1, 1, 16, &mem);
+        let l2 = SetAssociativeCache::new(1, 1, 8, &l3);
+        let l1 = SetAssociativeCache::new(1, 1, 4, &l2);
 
         // L3 is non-inclusive by default in this simulator, so we do not wire L3 -> L2.
         // Keep L2 -> L1 inclusive.
@@ -63,9 +63,9 @@ mod integration_tests {
     #[test]
     fn test_three_level_hierarchy_reads_latest_after_eviction_chain() {
         let mem = MainMemory::new(1024);
-        let l3 = L3Cache::new(1, 1, &mem);
-        let l2 = L2Cache::new(1, 1, &l3);
-        let l1 = L1Cache::new(1, 1, &l2);
+        let l3 = SetAssociativeCache::new(1, 1, 16, &mem);
+        let l2 = SetAssociativeCache::new(1, 1, 8, &l3);
+        let l1 = SetAssociativeCache::new(1, 1, 4, &l2);
 
         l2.set_invalidation_listener(&l1);
 
@@ -90,7 +90,7 @@ mod integration_tests {
                 load: 100,
                 store: 100,
             });
-        let l3 = L3Cache::new(1, 1, &mem)
+        let l3 = SetAssociativeCache::new(1, 1, 16, &mem)
             .with_clock(clock.clone())
             .with_timing(CacheTiming {
                 load_hit: 3,
@@ -101,7 +101,7 @@ mod integration_tests {
                 invalidation_send: 1,
                 invalidation_apply: 1,
             });
-        let l2 = L2Cache::new(1, 1, &l3)
+        let l2 = SetAssociativeCache::new(1, 1, 8, &l3)
             .with_clock(clock.clone())
             .with_timing(CacheTiming {
                 load_hit: 2,
@@ -112,7 +112,7 @@ mod integration_tests {
                 invalidation_send: 1,
                 invalidation_apply: 1,
             });
-        let l1 = L1Cache::new(1, 1, &l2)
+        let l1 = SetAssociativeCache::new(1, 1, 4, &l2)
             .with_clock(clock.clone())
             .with_timing(CacheTiming {
                 load_hit: 1,
@@ -139,8 +139,8 @@ mod integration_tests {
     #[test]
     fn test_non_inclusive_l3_eviction_does_not_invalidate_l2() {
         let mem = MainMemory::new(1024);
-        let l3 = L3Cache::new(1, 1, &mem);
-        let l2 = L2Cache::new(1, 1, &l3);
+        let l3 = SetAssociativeCache::new(1, 1, 16, &mem);
+        let l2 = SetAssociativeCache::new(1, 1, 8, &l3);
 
         // Intentionally no l3 -> l2 invalidation wiring (non-inclusive L3).
         assert_eq!(l2.load_u8(0), 0);
@@ -163,8 +163,8 @@ mod integration_tests {
     fn test_invalidation_is_line_granular_not_byte_granular() {
         // Small 1-way caches to make eviction deterministic.
         let mem = MainMemory::new(128);
-        let l2: Cache<'_, 1, _> = Cache::new(16, 1, &mem);
-        let l1: Cache<'_, 1, _> = Cache::new(16, 1, &l2);
+        let l2: SetAssociativeCache<'_> = SetAssociativeCache::new(16, 1, 1, &mem);
+        let l1: SetAssociativeCache<'_> = SetAssociativeCache::new(16, 1, 1, &l2);
         l2.set_invalidation_listener(&l1);
 
         mem.store_u8(7, 1);
