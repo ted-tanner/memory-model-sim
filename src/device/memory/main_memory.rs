@@ -40,6 +40,10 @@ impl MainMemory {
         self.size
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
     pub fn with_clock(mut self, clock: Rc<Clock>) -> Self {
         self.clock = Some(clock);
         self

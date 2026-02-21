@@ -215,6 +215,26 @@ clean:
     * Execute.
     * Stop when you hit `EBREAK`.
 
+### RISC-V programs layout
+* **`riscv-programs/include/`** – shared headers for the simulator ABI (e.g. `sim.h` with `sim_printf` for ecall printf, a7=1).
+* **`riscv-programs/helloworld/`** – minimal bare-metal example:
+  * `start.S` – sets stack, calls `main`, then `ebreak` to exit.
+  * `link.ld` – flat layout starting at `0x00000000`.
+  * `Makefile` – builds an ELF then flattens to **`firmware.bin`**, using `-I../include` for the shared header.
+  * `main.c` – includes `<sim.h>`, prints `Hello, world!` via `sim_printf()`.
+
+**Build:**
+```bash
+cd riscv-programs/helloworld
+make
+```
+This produces **`firmware.bin`**. You need a RISC-V 32-bit toolchain (e.g. `brew install llvm` with RISC-V support, or `riscv-none-elf-gcc` / `clang` with `riscv32-unknown-elf` target). If `clang` doesn’t support `riscv32-unknown-elf`, set `CC`/`LD`/`OBJCOPY` in the Makefile to your `riscv-none-elf-*` tools.
+
+Run the binary with the simulator:
+```bash
+cargo run -- firmware.bin
+```
+
 
 #### TODO:
 

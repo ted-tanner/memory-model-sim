@@ -4,6 +4,12 @@ pub struct Clock {
     tick: RefCell<u64>,
 }
 
+impl Default for Clock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Clock {
     pub fn new() -> Self {
         Self {
