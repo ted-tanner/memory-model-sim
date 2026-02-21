@@ -100,11 +100,30 @@ impl Default for Registers {
 
 type BuiltinMap = BTreeMap<u32, Box<dyn FnMut(&mut RiscV32IntegerMachine)>>;
 
+pub struct CsrBank {
+    store: BTreeMap<u16, u32>,
+}
+
+impl CsrBank {
+    fn new() -> Self {
+        Self {
+            store: BTreeMap::new(),
+        }
+    }
+    fn read(&self, csr: u16) -> u32 {
+        *self.store.get(&csr).unwrap_or(&0)
+    }
+    fn write(&mut self, csr: u16, value: u32) {
+        self.store.insert(csr, value);
+    }
+}
+
 pub struct RiscV32IntegerMachine {
     clock: Rc<Clock>,
     memory: &'static dyn MemoryDevice,
     registers: Registers,
     builtins: BuiltinMap,
+    csrs: CsrBank,
 }
 
 impl RiscV32IntegerMachine {
@@ -148,7 +167,6 @@ impl RiscV32IntegerMachine {
         invalidation_apply: 1,
     };
 
-    // RISC-V base opcodes (instruction & 0x7f)
     const OP_OP: u32 = 0x33;
     const OP_OP_IMM: u32 = 0x13;
     const OP_LUI: u32 = 0x37;
@@ -160,7 +178,14 @@ impl RiscV32IntegerMachine {
     const OP_STORE: u32 = 0x23;
     const OP_MISC_MEM: u32 = 0x0f;
     const OP_SYSTEM: u32 = 0x73;
-    // SYSTEM imm12 (instruction >> 20) & 0xfff
+
+    const F3_CSRRW: u32 = 0x1;
+    const F3_CSRRS: u32 = 0x2;
+    const F3_CSRRC: u32 = 0x3;
+    const F3_CSRRWI: u32 = 0x5;
+    const F3_CSRRSI: u32 = 0x6;
+    const F3_CSRRCI: u32 = 0x7;
+
     const SYS_ECALL: u32 = 0;
     const SYS_EBREAK: u32 = 1;
 
@@ -196,6 +221,7 @@ impl RiscV32IntegerMachine {
             memory: l1,
             registers: Registers::new(),
             builtins: BTreeMap::new(),
+            csrs: CsrBank::new(),
         };
         builtins::register_common_builtins(&mut machine);
         machine
@@ -319,11 +345,23 @@ impl RiscV32IntegerMachine {
             Self::OP_JAL | Self::OP_JALR => 3,
             Self::OP_LOAD | Self::OP_STORE => 3,
             Self::OP_MISC_MEM => 1,
-            Self::OP_SYSTEM => match (instruction >> 20) & 0xfff {
-                Self::SYS_ECALL => 8,
-                Self::SYS_EBREAK => 1,
-                _ => 2,
-            },
+            Self::OP_SYSTEM => {
+                let funct3 = (instruction >> 12) & 0x7;
+                match funct3 {
+                    0 => match (instruction >> 20) & 0xfff {
+                        Self::SYS_ECALL => 8,
+                        Self::SYS_EBREAK => 1,
+                        _ => 2,
+                    },
+                    Self::F3_CSRRW
+                    | Self::F3_CSRRS
+                    | Self::F3_CSRRC
+                    | Self::F3_CSRRWI
+                    | Self::F3_CSRRSI
+                    | Self::F3_CSRRCI => 5,
+                    _ => 1,
+                }
+            }
             _ => 1,
         }
     }
@@ -393,20 +431,82 @@ impl Default for RiscV32IntegerMachine {
 impl RiscV32IntegerMachine {
     fn op_system(&mut self, instruction: u32) -> StepResult {
         let imm12 = (instruction >> 20) & 0xfff;
-        if imm12 == 0 {
-            let a7 = self.x(17);
-            if let Some(mut handler) = self.builtins.remove(&a7) {
-                handler(self);
-                self.builtins.insert(a7, handler);
-                StepResult::Continue
+        let f3 = Self::funct3(instruction);
+        if f3 == 0 {
+            if imm12 == 0 {
+                let a7 = self.x(17);
+                if let Some(mut handler) = self.builtins.remove(&a7) {
+                    handler(self);
+                    self.builtins.insert(a7, handler);
+                    StepResult::Continue
+                } else {
+                    StepResult::Unimplemented("ECALL")
+                }
+            } else if imm12 == 1 {
+                StepResult::Halt(0)
             } else {
-                StepResult::Unimplemented("ECALL")
+                StepResult::Unimplemented("SYSTEM")
             }
-        } else if imm12 == 1 {
-            StepResult::Halt(0)
         } else {
-            StepResult::Unimplemented("SYSTEM")
+            self.op_csr(instruction, imm12 as u16, f3)
         }
+    }
+
+    // Machine will always be single-threaded, so we don't need to worry about ordering
+    fn op_csr(&mut self, instruction: u32, csr: u16, f3: u32) -> StepResult {
+        let rd = Self::rd(instruction);
+        let rs1 = Self::rs1(instruction);
+        let uimm = rs1 as u32;
+        let old = self.csrs.read(csr);
+        let write_value = match f3 {
+            Self::F3_CSRRW | Self::F3_CSRRWI => {
+                if f3 == Self::F3_CSRRWI {
+                    uimm
+                } else {
+                    self.x(rs1)
+                }
+            }
+            Self::F3_CSRRS | Self::F3_CSRRSI => {
+                old | if f3 == Self::F3_CSRRSI {
+                    uimm
+                } else {
+                    self.x(rs1)
+                }
+            }
+            Self::F3_CSRRC | Self::F3_CSRRCI => {
+                old & !(if f3 == Self::F3_CSRRCI {
+                    uimm
+                } else {
+                    self.x(rs1)
+                })
+            }
+            _ => return StepResult::Unimplemented("SYSTEM"),
+        };
+        let should_write_csr = match f3 {
+            Self::F3_CSRRW | Self::F3_CSRRWI => true,
+            Self::F3_CSRRS | Self::F3_CSRRSI => {
+                (if f3 == Self::F3_CSRRSI {
+                    uimm
+                } else {
+                    self.x(rs1)
+                }) != 0
+            }
+            Self::F3_CSRRC | Self::F3_CSRRCI => {
+                (if f3 == Self::F3_CSRRCI {
+                    uimm
+                } else {
+                    self.x(rs1)
+                }) != 0
+            }
+            _ => false,
+        };
+        if should_write_csr {
+            self.csrs.write(csr, write_value);
+        }
+        if rd != 0 {
+            self.set_x(rd, old);
+        }
+        StepResult::Continue
     }
 
     fn op_lui(&mut self, instruction: u32) -> StepResult {
@@ -628,6 +728,10 @@ mod tests {
             | opcode
     }
 
+    fn encode_csr(csr: u32, rs1: u8, funct3: u32, rd: u8) -> u32 {
+        (csr << 20) | ((rs1 as u32) << 15) | (funct3 << 12) | ((rd as u32) << 7) | 0x73
+    }
+
     fn assemble(instructions: &[u32]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(instructions.len() * 4);
         for insn in instructions {
@@ -660,6 +764,47 @@ mod tests {
         let result = machine.step();
         assert!(matches!(result, StepResult::Halt(0)));
         assert!(machine.current_tick() >= 1);
+    }
+
+    #[test]
+    fn csr_read_write_and_set_clear() {
+        // CSRRW: write a0 to CSR 0x300 (mstatus), copy old to t0
+        // CSRRS: set bits in CSR from t0, copy old to t1
+        // CSRRC: clear bits in CSR from t1, copy old to t2
+        // Then ebreak
+        let program = vec![
+            encode_i(0x123, 0, 0x0, 10, 0x13), // addi a0, x0, 0x123
+            encode_csr(0x300, 10, 0x1, 5), // csrrw t0, mstatus, a0  (rd=t0 gets old, csr gets 0x123)
+            encode_i(0x004, 0, 0x0, 6, 0x13), // addi t1, x0, 4
+            encode_csr(0x300, 6, 0x2, 7),  // csrrs t2, mstatus, t1   (set bit 2; t2 gets 0x123)
+            encode_csr(0x300, 7, 0x3, 28), // csrrc t3, mstatus, t2   (clear t2's bits; t3 gets new csr)
+            encode_i(1, 0, 0x0, 17, 0x13), // addi a7, x0, 1
+            0x0010_0073,                   // ebreak
+        ];
+        let mut m = machine_with_program(&program);
+        run_until_halt(&mut m);
+        // After csrrw: csr=0x123, t0=0
+        // After csrrs 4: csr=0x123|4=0x127, t2=0x123
+        // After csrrc 0x123: csr=0x127&!0x123=4, t3=0x127
+        assert_eq!(m.x(5), 0, "t0 (old mstatus)");
+        assert_eq!(m.x(7), 0x123, "t2 (old before set)");
+        assert_eq!(m.x(28), 0x127, "t3 (old before clear)");
+    }
+
+    #[test]
+    fn csr_immediate_variants_no_op_on_rd_or_rs1_zero() {
+        // CSRRWI x0, 0xC00, 0: rd=0 so no GPR write; uimm=0 so write 0 to CSR (no-op for CSRRSI/CSRRCI)
+        // CSRRWI t0, 0xC00, 7: t0 = old, CSR 0xC00 = 7
+        let program = vec![
+            encode_csr(0xC00, 0, 0x5, 0), // csrrwi x0, 0xC00, 0
+            encode_csr(0xC00, 7, 0x5, 5), // csrrwi t0, 0xC00, 7
+            encode_csr(0xC00, 0, 0x5, 6), // csrrwi t1, 0xC00, 0  -> t1 = 7, csr stays 7
+            0x0010_0073,                  // ebreak
+        ];
+        let mut m = machine_with_program(&program);
+        run_until_halt(&mut m);
+        assert_eq!(m.x(5), 0, "t0 gets previous CSR value (0)");
+        assert_eq!(m.x(6), 7, "t1 gets 7 from CSR before write of 0");
     }
 
     #[test]

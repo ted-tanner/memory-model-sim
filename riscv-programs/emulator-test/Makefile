@@ -17,7 +17,8 @@ CFLAGS   =
 LDFLAGS  = -m elf32lriscv
 endif
 
-CFLAGS  += -march=rv32i -mabi=ilp32 -ffreestanding -nostdlib -O2 -Wall
+# zicsr (CSR insns) and zifencei (fence.i) for emulator CSR/FENCE tests; sim is still rv32i
+CFLAGS  += -march=rv32i_zicsr_zifencei -mabi=ilp32 -ffreestanding -nostdlib -O2 -Wall
 CFLAGS  += -I$(TOPDIR)/include
 LDFLAGS += -T link.ld
 

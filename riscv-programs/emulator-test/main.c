@@ -122,6 +122,116 @@ static void test_printf(void)
 	builtin_printf("  %%s: %s\n", msg);
 }
 
+/* --- FENCE / FENCE.I (no-ops in single-threaded sim) --- */
+static void test_fence(void)
+{
+	builtin_printf("=== FENCE / FENCE.I (no-op) ===\n");
+	__asm__ volatile ("fence" ::: "memory");
+	__asm__ volatile ("fence.i" ::: "memory");
+	builtin_printf("  fence ok\n");
+	builtin_printf("  fence.i ok\n");
+}
+
+/* --- CSR (CSRRW/CSRRS/CSRRC and immediate variants) --- */
+#define CSR_TEST 0xC00u  /* arbitrary CSR for testing; sim bank accepts any */
+
+static unsigned csrrw(unsigned csr, unsigned val)
+{
+	register unsigned rd __asm__("a0");
+	__asm__ volatile ("csrrw %0, %1, %2" : "=r"(rd) : "i"(csr), "r"(val) : "memory");
+	return rd;
+}
+
+static unsigned csrrs(unsigned csr, unsigned mask)
+{
+	register unsigned rd __asm__("a0");
+	__asm__ volatile ("csrrs %0, %1, %2" : "=r"(rd) : "i"(csr), "r"(mask) : "memory");
+	return rd;
+}
+
+static unsigned csrrc(unsigned csr, unsigned mask)
+{
+	register unsigned rd __asm__("a0");
+	__asm__ volatile ("csrrc %0, %1, %2" : "=r"(rd) : "i"(csr), "r"(mask) : "memory");
+	return rd;
+}
+
+static unsigned csrrwi(unsigned csr, unsigned uimm)
+{
+	register unsigned rd __asm__("a0");
+	__asm__ volatile ("csrrwi %0, %1, %2" : "=r"(rd) : "i"(csr), "i"(uimm) : "memory");
+	return rd;
+}
+
+static unsigned csrrsi(unsigned csr, unsigned uimm)
+{
+	register unsigned rd __asm__("a0");
+	__asm__ volatile ("csrrsi %0, %1, %2" : "=r"(rd) : "i"(csr), "i"(uimm) : "memory");
+	return rd;
+}
+
+static unsigned csrrci(unsigned csr, unsigned uimm)
+{
+	register unsigned rd __asm__("a0");
+	__asm__ volatile ("csrrci %0, %1, %2" : "=r"(rd) : "i"(csr), "i"(uimm) : "memory");
+	return rd;
+}
+
+static void test_csr(void)
+{
+	builtin_printf("=== CSR (CSRRW/CSRRS/CSRRC + immediate) ===\n");
+
+	unsigned old;
+
+	/* CSRRW: write 0x123, rd gets previous (0) */
+	old = csrrw(CSR_TEST, 0x123u);
+	debug_assert(old == 0, "csrrw old==0");
+	builtin_printf("  csrrw write 0x123 old=%d\n", (int)old);
+
+	/* Read back via CSRRW with rs1=x0: write 0, rd gets 0x123 */
+	old = csrrw(CSR_TEST, 0);
+	debug_assert(old == 0x123u, "csrrw read 0x123");
+	builtin_printf("  csrrw read back %d\n", (int)old);
+
+	/* CSRRS: set bit 2 and 4; CSR becomes 20 */
+	old = csrrs(CSR_TEST, 4u | 16u);
+	debug_assert(old == 0, "csrrs old");
+	builtin_printf("  csrrs set 0x14 old=%d\n", (int)old);
+
+	/* CSRRC: clear bit 2; rd gets current CSR (20), CSR becomes 16 */
+	old = csrrc(CSR_TEST, 4u);
+	debug_assert(old == 20u, "csrrc old");
+	builtin_printf("  csrrc clear 4 old=%d\n", (int)old);
+	old = csrrw(CSR_TEST, 0);
+	debug_assert(old == 16u, "csrrc result 16");
+	builtin_printf("  csrrs/csrrc result %d\n", (int)old);
+
+	/* CSRRWI: write immediate 7 (CSR was 0 after previous read-back) */
+	old = csrrwi(CSR_TEST, 7);
+	debug_assert(old == 0, "csrrwi old");
+	builtin_printf("  csrrwi 7 old=%d\n", (int)old);
+	old = csrrwi(CSR_TEST, 0);
+	debug_assert(old == 7u, "csrrwi read 7");
+	builtin_printf("  csrrwi read %d\n", (int)old);
+
+	/* CSRRSI: set bits 0 and 1 (uimm 3); CSR becomes 3 */
+	old = csrrsi(CSR_TEST, 3);
+	debug_assert(old == 0, "csrrsi old");
+	builtin_printf("  csrrsi 3 old=%d\n", (int)old);
+
+	/* CSRRCI: clear bit 1 (uimm 2); rd gets 3, CSR becomes 1 */
+	old = csrrci(CSR_TEST, 2);
+	debug_assert(old == 3u, "csrrci old");
+	builtin_printf("  csrrci 2 old=%d\n", (int)old);
+	old = csrrwi(CSR_TEST, 0);
+	debug_assert(old == 1u, "csrrci result 1");
+	builtin_printf("  csrrwi/csrrsi/csrrci result %d\n", (int)old);
+
+	/* Leave CSR 0 for next run */
+	(void)csrrw(CSR_TEST, 0);
+	builtin_printf("  all CSR ops ok\n");
+}
+
 /* --- Entry: all tests then exit via ebreak in start.S --- */
 int main(void)
 {
@@ -130,6 +240,8 @@ int main(void)
 	test_alu();
 	test_memory();
 	test_branches();
+	test_fence();
+	test_csr();
 	builtin_printf("Done.\n");
 	return 0;
 }

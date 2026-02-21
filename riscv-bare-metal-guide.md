@@ -57,14 +57,14 @@ See the (RISC-V reference card for opcodes and more information)[https://github.
 | :--- | :--- | :--- |
 | `ECALL` | Environment Call | ✅ **Implement** (Use for `print()` hook) |
 | `EBREAK` | Environment Break | 🛑 **EXIT SIMULATOR** |
-| `FENCE` | Memory Ordering Barrier | ⚠️ Log "Unimplemented: FENCE" (No-op) |
-| `FENCE.I` | Instruction Cache Sync | ⚠️ Log "Unimplemented: FENCE.I" (No-op) |
-| `CSRRW` | Atomic Read/Write CSR | ⚠️ Log "Unimplemented: CSRRW" (Trap/No-op) |
-| `CSRRS` | Atomic Read/Set CSR | ⚠️ Log "Unimplemented: CSRRS" (Trap/No-op) |
-| `CSRRC` | Atomic Read/Clear CSR | ⚠️ Log "Unimplemented: CSRRC" (Trap/No-op) |
-| `CSRRWI` | Read/Write CSR Immediate | ⚠️ Log "Unimplemented: CSRRWI" (Trap/No-op) |
-| `CSRRSI` | Read/Set CSR Immediate | ⚠️ Log "Unimplemented: CSRRSI" (Trap/No-op) |
-| `CSRRCI` | Read/Clear CSR Immediate | ⚠️ Log "Unimplemented: CSRRCI" (Trap/No-op) |
+| `FENCE` | Memory Ordering Barrier | ✅ No-op (single-threaded) |
+| `FENCE.I` | Instruction Cache Sync | ✅ No-op (single-threaded) |
+| `CSRRW` | Atomic Read/Write CSR | ✅ Implement (CSR bank; unknown CSRs read 0) |
+| `CSRRS` | Atomic Read/Set CSR | ✅ Implement |
+| `CSRRC` | Atomic Read/Clear CSR | ✅ Implement |
+| `CSRRWI` | Read/Write CSR Immediate | ✅ Implement |
+| `CSRRSI` | Read/Set CSR Immediate | ✅ Implement |
+| `CSRRCI` | Read/Clear CSR Immediate | ✅ Implement |
 
 ---
 
