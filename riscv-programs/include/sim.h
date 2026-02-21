@@ -1,20 +1,18 @@
 #ifndef SIM_H
 
-/*
- * memory-model-sim host ABI (ecall with a7 = builtin number):
- *
- * a7 = 1 (printf): a0 = format string pointer, a1..a7 = variadic args.
- *                  Supports %d (signed int) and %s (char*). No libc.
- */
-
-static inline void sim_printf(const char *fmt)
+static void __attribute__((noinline, noclone)) sim_printf(const char *fmt, ...)
 {
+	(void)fmt;
 	__asm__ volatile (
-		"mv a0, %0\n"
 		"li a7, 1\n"
 		"ecall\n"
-		: : "r"(fmt) : "a0", "a7"
+		:: : "a7"
 	);
+}
+
+static inline void sim_exit(void)
+{
+	__asm__ volatile ("ebreak" :: :);
 }
 
 #define SIM_H

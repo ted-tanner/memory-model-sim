@@ -4,7 +4,7 @@
 
 _start:
     /* 1. Setup Stack Pointer to 1MB (Adjust if simulator RAM is smaller) */
-    li sp, 0x100000
+    li sp, 0x300000
 
     /* 2. Jump to C main() function */
     call main
