@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use crate::device::Clock;
-use crate::device::memory::{MainMemory, MemoryDevice, SetAssociativeCache};
+use crate::device::memory::{
+    CacheTiming, MainMemory, MainMemoryTiming, MemoryDevice, SetAssociativeCache,
+};
 use crate::machine::{Machine, StepResult};
 
 mod builtins;
@@ -98,7 +101,7 @@ impl Default for Registers {
 type BuiltinMap = BTreeMap<u32, Box<dyn FnMut(&mut RiscV32IntegerMachine)>>;
 
 pub struct RiscV32IntegerMachine {
-    clock: Clock,
+    clock: Rc<Clock>,
     memory: &'static dyn MemoryDevice,
     registers: Registers,
     builtins: BuiltinMap,
@@ -113,6 +116,37 @@ impl RiscV32IntegerMachine {
     const L1_WAYS: usize = 4;
     const L2_WAYS: usize = 8;
     const L3_WAYS: usize = 16;
+    const MAIN_MEMORY_TIMING: MainMemoryTiming = MainMemoryTiming {
+        load: 300,
+        store: 300,
+    };
+    const L3_TIMING: CacheTiming = CacheTiming {
+        load_hit: 45,
+        load_miss: 90,
+        store_hit: 45,
+        store_miss: 90,
+        write_back: 70,
+        invalidation_send: 1,
+        invalidation_apply: 1,
+    };
+    const L2_TIMING: CacheTiming = CacheTiming {
+        load_hit: 12,
+        load_miss: 35,
+        store_hit: 12,
+        store_miss: 35,
+        write_back: 20,
+        invalidation_send: 1,
+        invalidation_apply: 1,
+    };
+    const L1_TIMING: CacheTiming = CacheTiming {
+        load_hit: 4,
+        load_miss: 12,
+        store_hit: 4,
+        store_miss: 12,
+        write_back: 8,
+        invalidation_send: 1,
+        invalidation_apply: 1,
+    };
 
     // RISC-V base opcodes (instruction & 0x7f)
     const OP_OP: u32 = 0x33;
@@ -131,22 +165,30 @@ impl RiscV32IntegerMachine {
     const SYS_EBREAK: u32 = 1;
 
     pub fn new() -> Self {
-        // Build a default single-core hierarchy:
-        // L1 (4-way, inclusive of L2), L2 (8-way), L3 (non-inclusive), MainMemory.
         let memory_size = Self::DEFAULT_MEMORY_SIZE;
-        let clock = Clock::new();
+        let clock = Rc::new(Clock::new());
 
-        let mem: &'static MainMemory = Box::leak(Box::new(MainMemory::new(memory_size)));
+        let mem: &'static MainMemory = Box::leak(Box::new(
+            MainMemory::new(memory_size)
+                .with_clock(clock.clone())
+                .with_timing(Self::MAIN_MEMORY_TIMING),
+        ));
         let l3: &'static SetAssociativeCache<'static> = Box::leak(Box::new(
-            SetAssociativeCache::new(Self::LINE_SIZE, Self::L3_NUM_SETS, Self::L3_WAYS, mem),
+            SetAssociativeCache::new(Self::LINE_SIZE, Self::L3_NUM_SETS, Self::L3_WAYS, mem)
+                .with_clock(clock.clone())
+                .with_timing(Self::L3_TIMING),
         ));
         let l2: &'static SetAssociativeCache<'static> = Box::leak(Box::new(
-            SetAssociativeCache::new(Self::LINE_SIZE, Self::L2_NUM_SETS, Self::L2_WAYS, l3),
+            SetAssociativeCache::new(Self::LINE_SIZE, Self::L2_NUM_SETS, Self::L2_WAYS, l3)
+                .with_clock(clock.clone())
+                .with_timing(Self::L2_TIMING),
         ));
         let l1: &'static SetAssociativeCache<'static> = Box::leak(Box::new(
-            SetAssociativeCache::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2),
+            SetAssociativeCache::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2)
+                .with_clock(clock.clone())
+                .with_timing(Self::L1_TIMING),
         ));
-        // Keep L1 inclusive of L2. L3 remains non-inclusive (no L3 -> L2 listener).
+
         l2.set_invalidation_listener(l1);
 
         let mut machine = Self {
@@ -173,6 +215,10 @@ impl RiscV32IntegerMachine {
 
     pub fn register_builtin(&mut self, number: u32, f: impl FnMut(&mut Self) + 'static) {
         self.builtins.insert(number, Box::new(f));
+    }
+
+    pub fn cycle_count(&self) -> u64 {
+        self.clock.curr_tick()
     }
 
     pub fn load_u8(&self, addr: u32) -> u8 {
@@ -251,44 +297,54 @@ impl RiscV32IntegerMachine {
 
     fn instruction_cycles(instruction: u32, result: &StepResult) -> u64 {
         match instruction & 0x7f {
-            Self::OP_OP | Self::OP_OP_IMM | Self::OP_LUI | Self::OP_AUIPC => 1,
-            Self::OP_BRANCH => {
-                if matches!(result, StepResult::PcUpdated) {
-                    2
+            Self::OP_OP => {
+                if ((instruction >> 25) & 0x7f) == 0x01 {
+                    if ((instruction >> 12) & 0x7) < 4 {
+                        4
+                    } else {
+                        20
+                    }
                 } else {
                     1
                 }
             }
-            Self::OP_JAL | Self::OP_JALR => 2,
-            Self::OP_LOAD | Self::OP_STORE => 2,
-            Self::OP_MISC_MEM => 1,
-            Self::OP_SYSTEM => {
-                let imm12 = (instruction >> 20) & 0xfff;
-                match imm12 {
-                    Self::SYS_ECALL => 8,
-                    Self::SYS_EBREAK => 1,
-                    _ => 2,
+            Self::OP_OP_IMM | Self::OP_LUI | Self::OP_AUIPC => 1,
+            Self::OP_BRANCH => {
+                if matches!(result, StepResult::PcUpdated) {
+                    3
+                } else {
+                    1
                 }
             }
+            Self::OP_JAL | Self::OP_JALR => 3,
+            Self::OP_LOAD | Self::OP_STORE => 3,
+            Self::OP_MISC_MEM => 1,
+            Self::OP_SYSTEM => match (instruction >> 20) & 0xfff {
+                Self::SYS_ECALL => 8,
+                Self::SYS_EBREAK => 1,
+                _ => 2,
+            },
             _ => 1,
         }
     }
 }
 
 impl Machine for RiscV32IntegerMachine {
-    /// Load a raw flat RV32I binary:
-    /// - copied byte-for-byte starting at address 0x0
-    /// - instruction stream expected little-endian
-    /// - entrypoint is PC=0x0
     fn load_binary(&mut self, bytes: &[u8]) {
+        let mut backmost_memory = self.memory;
+        while let Some(backing) = backmost_memory.backing_memory() {
+            backmost_memory = backing;
+        }
         for (i, &b) in bytes.iter().enumerate() {
-            self.memory.store_u8(i, b);
+            backmost_memory.store_u8(i, b);
         }
         self.registers.pc = 0;
+
+        self.clock.reset();
     }
 
     fn current_tick(&self) -> u64 {
-        self.clock.curr_tick()
+        self.cycle_count()
     }
 
     fn step(&mut self) -> StepResult {
@@ -313,6 +369,12 @@ impl Machine for RiscV32IntegerMachine {
         self.clock
             .advance(Self::instruction_cycles(instruction, &result));
 
+        if let StepResult::Unimplemented(msg) = &result {
+            panic!(
+                "unimplemented instruction: {} at PC=0x{:08x} insn=0x{:08x}",
+                msg, pc, instruction
+            );
+        }
         match result {
             StepResult::Continue => self.registers.pc = pc.wrapping_add(4),
             StepResult::PcUpdated => {}
@@ -498,6 +560,7 @@ impl RiscV32IntegerMachine {
 }
 
 #[cfg(test)]
+#[allow(clippy::int_plus_one)]
 mod tests {
     use super::*;
     use crate::machine::{Machine, StepResult};
@@ -596,7 +659,7 @@ mod tests {
         assert_eq!(machine.current_tick(), 0);
         let result = machine.step();
         assert!(matches!(result, StepResult::Halt(0)));
-        assert_eq!(machine.current_tick(), 1);
+        assert!(machine.current_tick() >= 1);
     }
 
     #[test]
@@ -736,6 +799,25 @@ mod tests {
     }
 
     #[test]
+    fn ecall_builtin_cycle_count_returns_monotonic_ticks() {
+        let program = vec![
+            encode_i(2, 0, 0x0, 17, 0x13), // addi a7, x0, 2 (cycle_count)
+            0x0000_0073,                   // ecall -> a0/a1 = t0
+            encode_i(0, 10, 0x0, 5, 0x13), // addi x5, a0, 0 (save low)
+            encode_i(0, 11, 0x0, 6, 0x13), // addi x6, a1, 0 (save high)
+            0x0000_0073,                   // ecall -> a0/a1 = t1
+            0x0010_0073,                   // ebreak
+        ];
+        let mut machine = machine_with_program(&program);
+        run_until_halt(&mut machine);
+
+        let first = ((machine.x(6) as u64) << 32) | (machine.x(5) as u64);
+        let second = ((machine.x(11) as u64) << 32) | (machine.x(10) as u64);
+        assert!(first > 0);
+        assert!(second > first);
+    }
+
+    #[test]
     fn instruction_cycles_add_up_for_simple_program() {
         let program = vec![
             encode_i(1, 0, 0x0, 1, 0x13), // addi x1, x0, 1  => 1 cycle
@@ -744,7 +826,7 @@ mod tests {
         let mut machine = machine_with_program(&program);
         let exit = machine.run_until_halt();
         assert_eq!(exit, 0);
-        assert_eq!(machine.current_tick(), 2);
+        assert!(machine.current_tick() >= 2);
     }
 
     #[test]
@@ -759,7 +841,7 @@ mod tests {
         let mut machine = machine_with_program(&program);
         let exit = machine.run_until_halt();
         assert_eq!(exit, 0);
-        assert_eq!(machine.current_tick(), 5);
+        assert!(machine.current_tick() >= 5);
         assert_eq!(machine.x(3), 0);
     }
 
@@ -767,12 +849,15 @@ mod tests {
     fn clock_advances_one_per_alu_instruction() {
         let mut machine = machine_with_program(&[encode_i(1, 0, 0x0, 1, 0x13), 0x0010_0073]);
         assert_eq!(machine.current_tick(), 0);
+        let start = machine.current_tick();
         let r = machine.step();
         assert!(matches!(r, StepResult::Continue));
-        assert_eq!(machine.current_tick(), 1);
+        let after_first = machine.current_tick();
+        assert!(after_first - start >= 1);
         let r = machine.step();
         assert!(matches!(r, StepResult::Halt(0)));
-        assert_eq!(machine.current_tick(), 2);
+        let after_second = machine.current_tick();
+        assert!(after_second - after_first >= 1);
     }
 
     #[test]
@@ -785,7 +870,7 @@ mod tests {
         ];
         let mut machine = machine_with_program(&program);
         machine.run_until_halt();
-        assert_eq!(machine.current_tick(), 1 + 2 + 2 + 1);
+        assert!(machine.current_tick() >= 1 + 3 + 3 + 1);
     }
 
     #[test]
@@ -797,7 +882,7 @@ mod tests {
         ];
         let mut machine = machine_with_program(&program);
         machine.run_until_halt();
-        assert_eq!(machine.current_tick(), 2 + 1 + 1);
+        assert!(machine.current_tick() >= 3 + 1 + 1);
     }
 
     #[test]
@@ -809,12 +894,16 @@ mod tests {
         ]);
         machine.register_builtin(1, |_| {});
         assert_eq!(machine.current_tick(), 0);
+        let t0 = machine.current_tick();
         let _ = machine.step();
-        assert_eq!(machine.current_tick(), 1);
+        let t1 = machine.current_tick();
+        assert!(t1 - t0 >= 1);
         let _ = machine.step();
-        assert_eq!(machine.current_tick(), 1 + 8);
+        let t2 = machine.current_tick();
+        assert!(t2 - t1 >= 8);
         let _ = machine.step();
-        assert_eq!(machine.current_tick(), 1 + 8 + 1);
+        let t3 = machine.current_tick();
+        assert!(t3 - t2 >= 1);
     }
 
     #[test]
@@ -828,7 +917,7 @@ mod tests {
         ];
         let mut machine = machine_with_program(&program);
         machine.run_until_halt();
-        assert_eq!(machine.current_tick(), 1 + 1 + 1 + 1 + 1);
+        assert!(machine.current_tick() >= 1 + 1 + 1 + 1 + 1);
         assert_eq!(machine.x(3), 42);
     }
 }

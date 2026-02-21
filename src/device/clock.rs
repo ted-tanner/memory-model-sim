@@ -28,6 +28,10 @@ impl Clock {
     pub fn curr_tick(&self) -> u64 {
         *self.tick.borrow()
     }
+
+    pub fn reset(&self) {
+        *self.tick.borrow_mut() = 0;
+    }
 }
 
 #[cfg(test)]
@@ -58,5 +62,15 @@ mod tests {
 
         clock.advance(3);
         assert_eq!(clock.curr_tick(), 10);
+    }
+
+    #[test]
+    fn test_reset() {
+        let clock = Clock::new();
+        clock.advance(99);
+        assert_eq!(clock.curr_tick(), 99);
+
+        clock.reset();
+        assert_eq!(clock.curr_tick(), 0);
     }
 }

@@ -3,9 +3,11 @@ use std::io::{self, Write};
 use super::RiscV32IntegerMachine;
 
 pub const BUILTIN_PRINTF: u32 = 1;
+pub const BUILTIN_CYCLE_COUNT: u32 = 2;
 
 pub fn register_common_builtins(machine: &mut RiscV32IntegerMachine) {
     machine.register_builtin(BUILTIN_PRINTF, printf);
+    machine.register_builtin(BUILTIN_CYCLE_COUNT, cycle_count);
 }
 
 fn read_c_str(machine: &RiscV32IntegerMachine, ptr: u32) -> String {
@@ -60,4 +62,10 @@ pub fn printf(machine: &mut RiscV32IntegerMachine) {
         }
     }
     let _ = writeln!(out);
+}
+
+pub fn cycle_count(machine: &mut RiscV32IntegerMachine) {
+    let ticks = machine.cycle_count();
+    machine.set_x(10, ticks as u32);
+    machine.set_x(11, (ticks >> 32) as u32);
 }

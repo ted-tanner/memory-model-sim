@@ -355,6 +355,10 @@ impl<'a> MemoryDevice for SetAssociativeCache<'a> {
     fn store_i32(&self, addr: usize, n: i32) {
         self.store_u32(addr, n as u32);
     }
+
+    fn backing_memory(&self) -> Option<&dyn MemoryDevice> {
+        Some(self.backing_memory)
+    }
 }
 
 impl<'a> InvalidationListener for SetAssociativeCache<'a> {
