@@ -127,14 +127,18 @@ pub struct RiscV32IntegerMachine {
 }
 
 impl RiscV32IntegerMachine {
-    const DEFAULT_MEMORY_SIZE: usize = 4 * 1024 * 1024;
+    const DEFAULT_MEMORY_SIZE: usize = 4 * 1024 * 1024 * 1024; // 4GB
     const LINE_SIZE: usize = 64;
+
     const L1_NUM_SETS: usize = 64;
-    const L2_NUM_SETS: usize = 128;
-    const L3_NUM_SETS: usize = 256;
-    const L1_WAYS: usize = 4;
-    const L2_WAYS: usize = 8;
+    const L1_WAYS: usize = 8;
+
+    const L2_NUM_SETS: usize = 1024;
+    const L2_WAYS: usize = 16;
+
+    const L3_NUM_SETS: usize = 8192;
     const L3_WAYS: usize = 16;
+
     const MAIN_MEMORY_TIMING: MainMemoryTiming = MainMemoryTiming {
         load: 300,
         store: 300,

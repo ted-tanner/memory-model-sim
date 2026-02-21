@@ -2,7 +2,11 @@
 
 #define CACHE_LINE_BYTES 64
 #define PROBE_BYTES 256
-#define THRASH_BYTES (1024 * 1024)
+/*
+ * Keep this comfortably larger than LLC so cold probes are forced to main memory.
+ * Current machine config is 8 MiB L3, so use 32 MiB.
+ */
+#define THRASH_BYTES (32 * 1024 * 1024)
 
 static volatile unsigned char probe[PROBE_BYTES] __attribute__((aligned(CACHE_LINE_BYTES)));
 static volatile unsigned char thrash_buf[THRASH_BYTES] __attribute__((aligned(CACHE_LINE_BYTES)));
