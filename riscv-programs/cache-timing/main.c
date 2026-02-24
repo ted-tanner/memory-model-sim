@@ -10,7 +10,7 @@
 
 static volatile unsigned char probe[PROBE_BYTES] __attribute__((aligned(CACHE_LINE_BYTES)));
 static volatile unsigned char thrash_buf[THRASH_BYTES] __attribute__((aligned(CACHE_LINE_BYTES)));
-static volatile unsigned char sink;
+static volatile unsigned char sink; // Just here to prevent compiler optimizations
 
 static void debug_assert(int cond, const char *msg)
 {

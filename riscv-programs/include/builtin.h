@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+// Needs to not be inlined so the registers are set up corectly to be used by the printf builtin
 static void __attribute__((noinline, noclone)) builtin_printf(const char *fmt, ...)
 {
 	(void)fmt;
@@ -53,6 +54,20 @@ static inline void builtin_yield(void)
 		:
 		: "a7"
 	);
+}
+
+static inline uint32_t builtin_modulo(uint32_t dividend, uint32_t divisor)
+{
+	register uint32_t dividend_reg __asm__("a0") = dividend;
+	register uint32_t divisor_reg __asm__("a1") = divisor;
+	__asm__ volatile (
+		"li a7, 5\n"
+		"ecall\n"
+		: "+r"(dividend_reg)
+		: "r"(divisor_reg)
+		: "a7"
+	);
+	return dividend_reg;
 }
 
 #define BUILTIN_H

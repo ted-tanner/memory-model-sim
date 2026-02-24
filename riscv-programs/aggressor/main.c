@@ -77,7 +77,7 @@ static void probe(void) {
 int main(void) {
 	builtin_printf("aggressor: start");
 
-	for (int i = 0; i < 10; i++) {
+	for (int i = 0; i < 3; i++) {
 		builtin_printf("aggressor: yielding to victim", i);
 		builtin_yield();
 	}
@@ -86,7 +86,7 @@ int main(void) {
 	prime();
 	builtin_printf("aggressor: primed");
 
-	for (int i = 0; i < 10; i++) {
+	for (int i = 0; i < 3; i++) {
 		builtin_printf("aggressor: yielding to victim", i);
 		builtin_yield();
 	}

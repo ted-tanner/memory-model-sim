@@ -6,12 +6,14 @@ pub const BUILTIN_PRINTF: u32 = 1;
 pub const BUILTIN_CYCLE_COUNT: u32 = 2;
 pub const BUILTIN_RANDOM: u32 = 3;
 pub const BUILTIN_YIELD: u32 = 4;
+pub const BUILTIN_MODULO: u32 = 5;
 
 pub fn register_common_builtins(machine: &mut RiscV32IntegerMachine) {
     machine.register_builtin(BUILTIN_PRINTF, printf);
     machine.register_builtin(BUILTIN_CYCLE_COUNT, cycle_count);
     machine.register_builtin(BUILTIN_RANDOM, random);
     machine.register_builtin(BUILTIN_YIELD, yield_execution);
+    machine.register_builtin(BUILTIN_MODULO, modulo);
 }
 
 fn yield_execution(_machine: &mut RiscV32IntegerMachine) {
@@ -81,4 +83,12 @@ pub fn cycle_count(machine: &mut RiscV32IntegerMachine) {
     let ticks = machine.cycle_count();
     machine.set_x(10, ticks as u32);
     machine.set_x(11, (ticks >> 32) as u32);
+}
+
+// Base RV32I doesn't have a modulo and a naive implementation with subtraction
+// in a loop can take a LONG time for big numerators with small divisors
+pub fn modulo(machine: &mut RiscV32IntegerMachine) {
+    let dividend = machine.x(10);
+    let divisor = machine.x(11);
+    machine.set_x(10, dividend % divisor);
 }
