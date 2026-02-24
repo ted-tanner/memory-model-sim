@@ -9,12 +9,10 @@ const DEFAULT_DUAL_LAYOUT: DualProgramLayout = DualProgramLayout {
     program_a: ProgramLayout {
         load_base: 0x0000_0000,
         entry_pc: 0x0000_0000,
-        stack_top: 0x0030_0000,
     },
     program_b: ProgramLayout {
         load_base: 0x0001_0000,
         entry_pc: 0x0001_0000,
-        stack_top: 0x0040_0000,
     },
 };
 

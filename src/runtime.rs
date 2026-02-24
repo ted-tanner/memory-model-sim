@@ -11,10 +11,9 @@ struct ExecutionContext {
 }
 
 impl ExecutionContext {
-    fn new(entry_pc: u32, stack_top: u32) -> Self {
+    fn new(entry_pc: u32) -> Self {
         let mut registers = Registers::new();
         registers.pc = entry_pc;
-        registers.set_sp(stack_top);
         Self {
             registers,
             exited: false,
@@ -27,7 +26,6 @@ impl ExecutionContext {
 pub struct ProgramLayout {
     pub load_base: u32,
     pub entry_pc: u32,
-    pub stack_top: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -58,8 +56,8 @@ pub fn run_dual_flat_binary_bytes(
     machine.load_binary_at(program_b_bytes, layout.program_b.load_base);
 
     let mut contexts = [
-        ExecutionContext::new(layout.program_a.entry_pc, layout.program_a.stack_top),
-        ExecutionContext::new(layout.program_b.entry_pc, layout.program_b.stack_top),
+        ExecutionContext::new(layout.program_a.entry_pc),
+        ExecutionContext::new(layout.program_b.entry_pc),
     ];
     let mut current = 0usize;
     machine.restore_registers(&contexts[current].registers);
@@ -170,12 +168,10 @@ mod tests {
             program_a: ProgramLayout {
                 load_base: 0,
                 entry_pc: 0,
-                stack_top: 0x0030_0000,
             },
             program_b: ProgramLayout {
                 load_base: 0x0001_0000,
                 entry_pc: 0x0001_0000,
-                stack_top: 0x0040_0000,
             },
         };
 
