@@ -48,10 +48,6 @@ int main(void)
 
 	builtin_printf("Cache timing test\n");
 
-	/*
-	 * Test 1: first touch after a full cache thrash should be expensive
-	 * (likely main-memory path), while immediate re-access should hit L1.
-	 */
 	thrash_caches();
 	int cold = timed_load(&probe[0]);
 	int hot = timed_load(&probe[0]);
@@ -59,11 +55,6 @@ int main(void)
 	builtin_printf("hot  probe[0]: %d cycles\n", hot);
 	debug_assert(cold > hot, "cold access should be slower than hot L1 hit");
 
-	/*
-	 * Test 2: prove line fill behavior.
-	 * Accessing probe[0] should pull its whole 64-byte line. Then probe[60]
-	 * (same line) should be fast, while probe[64] (next line) should be slower.
-	 */
 	thrash_caches();
 	int first_line_miss = timed_load(&probe[0]);
 	int same_line_hit = timed_load(&probe[CACHE_LINE_BYTES - 4]);
