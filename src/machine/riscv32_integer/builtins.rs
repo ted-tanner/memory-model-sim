@@ -4,10 +4,23 @@ use super::RiscV32IntegerMachine;
 
 pub const BUILTIN_PRINTF: u32 = 1;
 pub const BUILTIN_CYCLE_COUNT: u32 = 2;
+pub const BUILTIN_RANDOM: u32 = 3;
+pub const BUILTIN_YIELD: u32 = 4;
 
 pub fn register_common_builtins(machine: &mut RiscV32IntegerMachine) {
     machine.register_builtin(BUILTIN_PRINTF, printf);
     machine.register_builtin(BUILTIN_CYCLE_COUNT, cycle_count);
+    machine.register_builtin(BUILTIN_RANDOM, random);
+    machine.register_builtin(BUILTIN_YIELD, yield_execution);
+}
+
+fn yield_execution(_machine: &mut RiscV32IntegerMachine) {
+    // No-op; scheduler forces context switch on ForceYield
+}
+
+fn random(machine: &mut RiscV32IntegerMachine) {
+    let state = machine.random_state();
+    machine.set_x(10, state as u32);
 }
 
 fn read_c_str(machine: &RiscV32IntegerMachine, ptr: u32) -> String {

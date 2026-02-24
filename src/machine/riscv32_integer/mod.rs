@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
 use std::rc::Rc;
 
 use crate::device::Clock;
@@ -9,6 +11,7 @@ use crate::machine::{Machine, StepResult};
 
 mod builtins;
 
+#[derive(Clone)]
 pub struct Registers {
     pub pc: u32,
     pub x: [u32; 32],
@@ -243,12 +246,28 @@ impl RiscV32IntegerMachine {
         self.registers.pc = pc;
     }
 
+    pub fn snapshot_registers(&self) -> Registers {
+        self.registers.clone()
+    }
+
+    pub fn restore_registers(&mut self, registers: &Registers) {
+        self.registers = registers.clone();
+    }
+
     pub fn register_builtin(&mut self, number: u32, f: impl FnMut(&mut Self) + 'static) {
         self.builtins.insert(number, Box::new(f));
     }
 
     pub fn cycle_count(&self) -> u64 {
         self.clock.curr_tick()
+    }
+
+    pub fn random_state(&mut self) -> u32 {
+        let mut f = File::open("/dev/urandom").expect("unable to open /dev/urandom");
+        let mut buf = [0u8; 4];
+        f.read_exact(&mut buf)
+            .expect("unable to read from /dev/urandom");
+        u32::from_ne_bytes(buf)
     }
 
     pub fn load_u8(&self, addr: u32) -> u8 {
@@ -373,16 +392,19 @@ impl RiscV32IntegerMachine {
 
 impl Machine for RiscV32IntegerMachine {
     fn load_binary(&mut self, bytes: &[u8]) {
+        self.load_binary_at(bytes, 0);
+        self.registers.pc = 0;
+        self.clock.reset();
+    }
+
+    fn load_binary_at(&mut self, bytes: &[u8], base: u32) {
         let mut backmost_memory = self.memory;
         while let Some(backing) = backmost_memory.backing_memory() {
             backmost_memory = backing;
         }
         for (i, &b) in bytes.iter().enumerate() {
-            backmost_memory.store_u8(i, b);
+            backmost_memory.store_u8(base as usize + i, b);
         }
-        self.registers.pc = 0;
-
-        self.clock.reset();
     }
 
     fn current_tick(&self) -> u64 {
@@ -418,7 +440,8 @@ impl Machine for RiscV32IntegerMachine {
             );
         }
         match result {
-            StepResult::Continue => self.registers.pc = pc.wrapping_add(4),
+            StepResult::Continue | StepResult::Yield => self.registers.pc = pc.wrapping_add(4),
+            StepResult::ForceYield => self.registers.pc = pc.wrapping_add(4),
             StepResult::PcUpdated => {}
             _ => {}
         }
@@ -442,7 +465,11 @@ impl RiscV32IntegerMachine {
                 if let Some(mut handler) = self.builtins.remove(&a7) {
                     handler(self);
                     self.builtins.insert(a7, handler);
-                    StepResult::Continue
+                    if a7 == builtins::BUILTIN_YIELD {
+                        StepResult::ForceYield
+                    } else {
+                        StepResult::Yield
+                    }
                 } else {
                     StepResult::Unimplemented("ECALL")
                 }
@@ -753,7 +780,10 @@ mod tests {
     fn run_until_halt(machine: &mut RiscV32IntegerMachine) {
         loop {
             match machine.step() {
-                StepResult::Continue | StepResult::PcUpdated => {}
+                StepResult::Continue
+                | StepResult::Yield
+                | StepResult::ForceYield
+                | StepResult::PcUpdated => {}
                 StepResult::Halt(_) => break,
                 StepResult::Unimplemented(op) => panic!("unexpected unimplemented: {op}"),
             }
@@ -945,6 +975,22 @@ mod tests {
 
         run_until_halt(&mut machine);
         assert_eq!(machine.x(10), 42);
+    }
+
+    #[test]
+    fn ecall_builtin_returns_yield_and_advances_pc() {
+        let program = vec![
+            encode_i(1, 0, 0x0, 17, 0x13), // addi a7, x0, 1
+            0x0000_0073,                   // ecall
+            0x0010_0073,                   // ebreak
+        ];
+        let mut machine = machine_with_program(&program);
+        machine.register_builtin(1, |_| {});
+
+        assert!(matches!(machine.step(), StepResult::Continue));
+        let result = machine.step();
+        assert!(matches!(result, StepResult::Yield));
+        assert!(matches!(machine.step(), StepResult::Halt(0)));
     }
 
     #[test]

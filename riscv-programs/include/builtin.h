@@ -1,4 +1,5 @@
 #ifndef BUILTIN_H
+
 #include <stdint.h>
 
 static void __attribute__((noinline, noclone)) builtin_printf(const char *fmt, ...)
@@ -28,6 +29,30 @@ static inline uint64_t builtin_cycle_count(void)
 		: "a7"
 	);
 	return ((uint64_t)hi << 32) | lo;
+}
+
+static inline uint32_t builtin_random(void)
+{
+	register uint32_t out __asm__("a0");
+	__asm__ volatile (
+		"li a7, 3\n"
+		"ecall\n"
+		: "=r"(out)
+		:
+		: "a7"
+	);
+	return out;
+}
+
+static inline void builtin_yield(void)
+{
+	__asm__ volatile (
+		"li a7, 4\n"
+		"ecall\n"
+		:
+		:
+		: "a7"
+	);
 }
 
 #define BUILTIN_H
