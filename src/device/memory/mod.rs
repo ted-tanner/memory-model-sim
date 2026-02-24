@@ -23,8 +23,6 @@ pub trait MemoryDevice {
     fn load_i32(&self, addr: usize) -> i32;
     fn store_i32(&self, addr: usize, n: i32);
 
-    /// Returns the next lower level in the hierarchy (if any).
-    /// For caches this is the backing device; for main memory this is None.
     fn backing_memory(&self) -> Option<&dyn MemoryDevice> {
         None
     }

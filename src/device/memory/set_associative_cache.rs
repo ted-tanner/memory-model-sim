@@ -92,9 +92,6 @@ impl<'a> SetAssociativeCache<'a> {
         self
     }
 
-    /// Registers a listener for inclusive hierarchies. When this cache evicts a line,
-    /// it will call `listener.invalidate_line(base_addr)` so the upper-level cache
-    /// can remove that line (maintaining L1 ⊆ L2).
     pub fn set_invalidation_listener(&self, listener: &'a dyn InvalidationListener) {
         *self.invalidation_listener.borrow_mut() = Some(listener);
     }
