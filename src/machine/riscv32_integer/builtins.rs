@@ -22,7 +22,7 @@ fn yield_execution(_machine: &mut RiscV32IntegerMachine) {
 
 fn random(machine: &mut RiscV32IntegerMachine) {
     let state = machine.random_state();
-    machine.set_x(10, state as u32);
+    machine.set_x(10, state);
 }
 
 fn read_c_str(machine: &mut RiscV32IntegerMachine, ptr: u32) -> String {

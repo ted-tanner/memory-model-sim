@@ -68,21 +68,31 @@ pub fn run_dual_flat_binary_bytes(
     };
 
     assert!(
-        segment_a.as_range().contains(&(layout.program_a.load_base as u64))
-            && segment_a.as_range().contains(&(layout.program_a.entry_pc as u64)),
+        segment_a
+            .as_range()
+            .contains(&(layout.program_a.load_base as u64))
+            && segment_a
+                .as_range()
+                .contains(&(layout.program_a.entry_pc as u64)),
         "program A layout must stay within the first half of memory"
     );
     assert!(
-        segment_b.as_range().contains(&(layout.program_b.load_base as u64))
-            && segment_b.as_range().contains(&(layout.program_b.entry_pc as u64)),
+        segment_b
+            .as_range()
+            .contains(&(layout.program_b.load_base as u64))
+            && segment_b
+                .as_range()
+                .contains(&(layout.program_b.entry_pc as u64)),
         "program B layout must stay within the second half of memory"
     );
     assert!(
-        (layout.program_a.load_base as u64) + program_a_bytes.len() as u64 <= segment_a.end_exclusive,
+        (layout.program_a.load_base as u64) + program_a_bytes.len() as u64
+            <= segment_a.end_exclusive,
         "program A binary does not fit within the first half of memory"
     );
     assert!(
-        (layout.program_b.load_base as u64) + program_b_bytes.len() as u64 <= segment_b.end_exclusive,
+        (layout.program_b.load_base as u64) + program_b_bytes.len() as u64
+            <= segment_b.end_exclusive,
         "program B binary does not fit within the second half of memory"
     );
 

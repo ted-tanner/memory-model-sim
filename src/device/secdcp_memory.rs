@@ -434,7 +434,9 @@ impl<'a> SecDcpMemory<'a> {
 
     #[cfg(test)]
     fn debug_line_owner(&self, set_idx: usize, way: usize) -> Option<SecurityClass> {
-        self.cache.borrow()[set_idx][way].as_ref().map(|line| line.owner)
+        self.cache.borrow()[set_idx][way]
+            .as_ref()
+            .map(|line| line.owner)
     }
 }
 

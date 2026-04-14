@@ -36,7 +36,7 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliConfig, S
     let mut positional = Vec::new();
 
     for arg in args {
-        if let Some(value) = arg.strip_prefix("--memorymodel=") {
+        if let Some(value) = arg.strip_prefix("--memory-model=") {
             memory_model = parse_memory_model(value)?;
         } else {
             positional.push(arg);
@@ -67,7 +67,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = match parse_cli_args(args) {
         Ok(config) => config,
         Err(err) => {
-            eprintln!("Usage: {bin} [--memorymodel=default|secdcp] <flat-binary-path> [flat-binary-path-2]");
+            eprintln!(
+                "Usage: {bin} [--memory-model=default|secdcp] <flat-binary-path> [flat-binary-path-2]"
+            );
             return Err(err.into());
         }
     };
@@ -130,7 +132,7 @@ mod tests {
     #[test]
     fn parse_cli_accepts_secdcp_memory_model() {
         let config = parse_cli_args([
-            "--memorymodel=secdcp".to_string(),
+            "--memory-model=secdcp".to_string(),
             "a.bin".to_string(),
             "b.bin".to_string(),
         ])
@@ -142,11 +144,8 @@ mod tests {
 
     #[test]
     fn parse_cli_rejects_unknown_memory_model() {
-        let err = parse_cli_args([
-            "--memorymodel=bogus".to_string(),
-            "a.bin".to_string(),
-        ])
-        .unwrap_err();
+        let err =
+            parse_cli_args(["--memory-model=bogus".to_string(), "a.bin".to_string()]).unwrap_err();
         assert!(err.contains("unsupported memory model"));
     }
 }
