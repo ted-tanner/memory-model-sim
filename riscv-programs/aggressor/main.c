@@ -84,20 +84,23 @@ static void clear_attack_scores(void) {
 	}
 }
 
-static uint32_t hottest_set(void) {
-	uint32_t best_set = 0;
-	uint32_t best_rounds = disturbed_rounds[0];
-	uint64_t best_total = total_disturbance[0];
+static int hottest_set(void) {
+	int best_set = -1;
+	uint32_t best_rounds = 0;
+	uint64_t best_total = 0;
 
-	for (uint32_t set = 1; set < NUM_SETS; set++) {
-		if (disturbed_rounds[set] > best_rounds) {
-			best_set = set;
+	for (uint32_t set = 0; set < NUM_SETS; set++) {
+		if (total_disturbance[set] == 0 && disturbed_rounds[set] == 0) {
+			continue;
+		}
+		if ((int)set == -1 || disturbed_rounds[set] > best_rounds) {
+			best_set = (int)set;
 			best_rounds = disturbed_rounds[set];
 			best_total = total_disturbance[set];
 			continue;
 		}
 		if (disturbed_rounds[set] == best_rounds && total_disturbance[set] > best_total) {
-			best_set = set;
+			best_set = (int)set;
 			best_total = total_disturbance[set];
 		}
 	}
@@ -162,9 +165,14 @@ static void run_attack(void) {
 }
 
 static void report_inference(void) {
-	uint32_t secret_set = hottest_set();
+	int secret_set = hottest_set();
 
-	builtin_printf("aggressor: inferred password set=%d", (int)secret_set);
+	if (secret_set < 0) {
+		builtin_printf("aggressor: could not find password set");
+		return;
+	}
+
+	builtin_printf("aggressor: inferred password set=%d", secret_set);
 
 	report_top_sets();
 }

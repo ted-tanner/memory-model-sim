@@ -29,4 +29,4 @@ pub trait Machine {
 }
 
 mod riscv32_integer;
-pub use riscv32_integer::{Registers, RiscV32IntegerMachine};
+pub use riscv32_integer::{MemoryModel, MemorySegment, Registers, RiscV32IntegerMachine};

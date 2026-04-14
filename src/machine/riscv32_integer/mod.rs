@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
+use std::ops::Range;
 use std::rc::Rc;
 
 use crate::device::Clock;
 use crate::device::memory::{
     CacheTiming, MainMemory, MainMemoryTiming, MemoryDevice, SetAssociativeCache,
 };
+use crate::device::secdcp_memory::{SecDcpMemory, SecurityClass, SecurityClassControl};
 use crate::machine::{Machine, StepResult};
 
 mod builtins;
@@ -103,6 +105,30 @@ impl Default for Registers {
 
 type BuiltinMap = BTreeMap<u32, Box<dyn FnMut(&mut RiscV32IntegerMachine)>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemorySegment {
+    pub start: u32,
+    pub end_exclusive: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryModel {
+    Default,
+    SecDcp,
+}
+
+impl MemorySegment {
+    fn contains_range(&self, addr: u32, size: u32) -> bool {
+        let start = addr as u64;
+        let end = start.saturating_add(size as u64);
+        start >= self.start as u64 && end <= self.end_exclusive
+    }
+
+    pub fn as_range(&self) -> Range<u64> {
+        self.start as u64..self.end_exclusive
+    }
+}
+
 pub struct CsrBank {
     store: BTreeMap<u16, u32>,
 }
@@ -127,6 +153,10 @@ pub struct RiscV32IntegerMachine {
     registers: Registers,
     builtins: BuiltinMap,
     csrs: CsrBank,
+    security_class_control: Option<&'static dyn SecurityClassControl>,
+    security_class: SecurityClass,
+    memory_segment: MemorySegment,
+    pending_fault_exit_code: Option<i32>,
 }
 
 impl RiscV32IntegerMachine {
@@ -196,7 +226,18 @@ impl RiscV32IntegerMachine {
     const SYS_ECALL: u32 = 0;
     const SYS_EBREAK: u32 = 1;
 
+    fn full_memory_segment() -> MemorySegment {
+        MemorySegment {
+            start: 0,
+            end_exclusive: Self::DEFAULT_MEMORY_SIZE as u64,
+        }
+    }
+
     pub fn new() -> Self {
+        Self::with_memory_model(MemoryModel::Default)
+    }
+
+    pub fn with_memory_model(model: MemoryModel) -> Self {
         let memory_size = Self::DEFAULT_MEMORY_SIZE;
         let clock = Rc::new(Clock::new());
 
@@ -215,22 +256,42 @@ impl RiscV32IntegerMachine {
                 .with_clock(clock.clone())
                 .with_timing(Self::L2_TIMING),
         ));
-        let l1: &'static SetAssociativeCache<'static> = Box::leak(Box::new(
-            SetAssociativeCache::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2)
-                .with_clock(clock.clone())
-                .with_timing(Self::L1_TIMING),
-        ));
-
-        l2.set_invalidation_listener(l1);
+        let (memory, security_class_control): (
+            &'static dyn MemoryDevice,
+            Option<&'static dyn SecurityClassControl>,
+        ) = match model {
+            MemoryModel::Default => {
+                let l1: &'static SetAssociativeCache<'static> = Box::leak(Box::new(
+                    SetAssociativeCache::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2)
+                        .with_clock(clock.clone())
+                        .with_timing(Self::L1_TIMING),
+                ));
+                l2.set_invalidation_listener(l1);
+                (l1, None)
+            }
+            MemoryModel::SecDcp => {
+                let secdcp_l1: &'static SecDcpMemory<'static> = Box::leak(Box::new(
+                    SecDcpMemory::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2)
+                        .with_clock(clock.clone())
+                        .with_timing(Self::L1_TIMING),
+                ));
+                (secdcp_l1, Some(secdcp_l1))
+            }
+        };
 
         let mut machine = Self {
             clock,
-            memory: l1,
+            memory,
             registers: Registers::new(),
             builtins: BTreeMap::new(),
             csrs: CsrBank::new(),
+            security_class_control,
+            security_class: SecurityClass::High,
+            memory_segment: Self::full_memory_segment(),
+            pending_fault_exit_code: None,
         };
         builtins::register_common_builtins(&mut machine);
+        machine.set_security_class(SecurityClass::High);
         machine
     }
 
@@ -254,6 +315,35 @@ impl RiscV32IntegerMachine {
         self.registers = registers.clone();
     }
 
+    pub fn set_memory_segment(&mut self, segment: MemorySegment) {
+        self.memory_segment = segment;
+        self.pending_fault_exit_code = None;
+    }
+
+    pub fn clear_memory_segment(&mut self) {
+        self.memory_segment = Self::full_memory_segment();
+        self.pending_fault_exit_code = None;
+    }
+
+    pub fn memory_segment(&self) -> MemorySegment {
+        self.memory_segment
+    }
+
+    pub fn memory_size_bytes(&self) -> u64 {
+        Self::DEFAULT_MEMORY_SIZE as u64
+    }
+
+    pub fn set_security_class(&mut self, class: SecurityClass) {
+        self.security_class = class;
+        if let Some(control) = self.security_class_control {
+            control.set_requester_class(class);
+        }
+    }
+
+    pub fn security_class(&self) -> SecurityClass {
+        self.security_class
+    }
+
     pub fn register_builtin(&mut self, number: u32, f: impl FnMut(&mut Self) + 'static) {
         self.builtins.insert(number, Box::new(f));
     }
@@ -270,29 +360,70 @@ impl RiscV32IntegerMachine {
         u32::from_ne_bytes(buf)
     }
 
-    pub fn load_u8(&self, addr: u32) -> u8 {
-        self.memory.load_u8(addr as usize)
+    fn record_memory_fault(&mut self) {
+        if self.pending_fault_exit_code.is_none() {
+            self.pending_fault_exit_code = Some(-11);
+        }
     }
-    pub fn load_i8(&self, addr: u32) -> i8 {
-        self.memory.load_i8(addr as usize)
+
+    fn clear_pending_fault(&mut self) {
+        self.pending_fault_exit_code = None;
     }
-    pub fn load_u16(&self, addr: u32) -> u16 {
-        self.memory.load_u16(addr as usize)
+
+    fn take_pending_fault(&mut self) -> Option<i32> {
+        self.pending_fault_exit_code.take()
     }
-    pub fn load_i16(&self, addr: u32) -> i16 {
-        self.memory.load_i16(addr as usize)
+
+    fn ensure_segment_access(&mut self, addr: u32, size: u32) -> bool {
+        if !self.memory_segment.contains_range(addr, size) {
+            self.record_memory_fault();
+            false
+        } else {
+            true
+        }
     }
-    pub fn load_u32(&self, addr: u32) -> u32 {
-        self.memory.load_u32(addr as usize)
+
+    pub fn load_u8(&mut self, addr: u32) -> u8 {
+        if self.ensure_segment_access(addr, 1) {
+            self.memory.load_u8(addr as usize)
+        } else {
+            0
+        }
+    }
+    pub fn load_i8(&mut self, addr: u32) -> i8 {
+        self.load_u8(addr) as i8
+    }
+    pub fn load_u16(&mut self, addr: u32) -> u16 {
+        if self.ensure_segment_access(addr, 2) {
+            self.memory.load_u16(addr as usize)
+        } else {
+            0
+        }
+    }
+    pub fn load_i16(&mut self, addr: u32) -> i16 {
+        self.load_u16(addr) as i16
+    }
+    pub fn load_u32(&mut self, addr: u32) -> u32 {
+        if self.ensure_segment_access(addr, 4) {
+            self.memory.load_u32(addr as usize)
+        } else {
+            0
+        }
     }
     pub fn store_u8(&mut self, addr: u32, v: u8) {
-        self.memory.store_u8(addr as usize, v);
+        if self.ensure_segment_access(addr, 1) {
+            self.memory.store_u8(addr as usize, v);
+        }
     }
     pub fn store_u16(&mut self, addr: u32, v: u16) {
-        self.memory.store_u16(addr as usize, v);
+        if self.ensure_segment_access(addr, 2) {
+            self.memory.store_u16(addr as usize, v);
+        }
     }
     pub fn store_u32(&mut self, addr: u32, v: u32) {
-        self.memory.store_u32(addr as usize, v);
+        if self.ensure_segment_access(addr, 4) {
+            self.memory.store_u32(addr as usize, v);
+        }
     }
 
     fn rd(instruction: u32) -> u8 {
@@ -392,6 +523,7 @@ impl RiscV32IntegerMachine {
 
 impl Machine for RiscV32IntegerMachine {
     fn load_binary(&mut self, bytes: &[u8]) {
+        self.clear_memory_segment();
         self.load_binary_at(bytes, 0);
         self.registers.pc = 0;
         self.clock.reset();
@@ -412,8 +544,12 @@ impl Machine for RiscV32IntegerMachine {
     }
 
     fn step(&mut self) -> StepResult {
+        self.clear_pending_fault();
         let pc = self.registers.pc;
         let instruction = self.load_u32(pc);
+        if let Some(code) = self.take_pending_fault() {
+            return StepResult::Halt(code);
+        }
 
         let result = match instruction & 0x7f {
             Self::OP_SYSTEM => self.op_system(instruction),
@@ -429,6 +565,10 @@ impl Machine for RiscV32IntegerMachine {
             Self::OP_MISC_MEM => self.op_misc_mem(instruction),
             _ => StepResult::Unimplemented("unknown opcode"),
         };
+
+        if let Some(code) = self.take_pending_fault() {
+            return StepResult::Halt(code);
+        }
 
         self.clock
             .advance(Self::instruction_cycles(instruction, &result));

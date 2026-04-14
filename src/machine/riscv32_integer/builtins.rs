@@ -25,11 +25,12 @@ fn random(machine: &mut RiscV32IntegerMachine) {
     machine.set_x(10, state as u32);
 }
 
-fn read_c_str(machine: &RiscV32IntegerMachine, ptr: u32) -> String {
+fn read_c_str(machine: &mut RiscV32IntegerMachine, ptr: u32) -> String {
     let mut s = Vec::new();
     let mut addr = ptr;
     loop {
-        let b = (machine.load_u32(addr & !3) >> ((addr & 3) * 8)) as u8;
+        let word = machine.load_u32(addr & !3);
+        let b = (word >> ((addr & 3) * 8)) as u8;
         if b == 0 {
             break;
         }
@@ -48,7 +49,8 @@ pub fn printf(machine: &mut RiscV32IntegerMachine) {
     let mut out = stdout.lock();
 
     loop {
-        let b = (machine.load_u32(addr & !3) >> ((addr & 3) * 8)) as u8;
+        let word = machine.load_u32(addr & !3);
+        let b = (word >> ((addr & 3) * 8)) as u8;
         addr = addr.wrapping_add(1);
         if b == 0 {
             break;
@@ -57,7 +59,8 @@ pub fn printf(machine: &mut RiscV32IntegerMachine) {
             let _ = out.write_all(&[b]);
             continue;
         }
-        let spec = (machine.load_u32(addr & !3) >> ((addr & 3) * 8)) as u8;
+        let word = machine.load_u32(addr & !3);
+        let spec = (word >> ((addr & 3) * 8)) as u8;
         addr = addr.wrapping_add(1);
         match spec {
             b'd' => {

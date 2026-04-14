@@ -1,21 +1,26 @@
 use std::fs;
 use std::path::Path;
 
-use crate::machine::{Machine, Registers, RiscV32IntegerMachine, StepResult};
+use crate::device::secdcp_memory::SecurityClass;
+use crate::machine::{Machine, MemorySegment, Registers, RiscV32IntegerMachine, StepResult};
 
 #[derive(Clone)]
 struct ExecutionContext {
     registers: Registers,
+    memory_segment: MemorySegment,
+    security_class: SecurityClass,
     exited: bool,
     exit_code: i32,
 }
 
 impl ExecutionContext {
-    fn new(entry_pc: u32) -> Self {
+    fn new(entry_pc: u32, memory_segment: MemorySegment, security_class: SecurityClass) -> Self {
         let mut registers = Registers::new();
         registers.pc = entry_pc;
         Self {
             registers,
+            memory_segment,
+            security_class,
             exited: false,
             exit_code: 0,
         }
@@ -51,15 +56,46 @@ pub fn run_dual_flat_binary_bytes(
     layout: DualProgramLayout,
 ) -> (i32, i32) {
     const CTX_SWITCH_AFTER_CYCLE_COUNT: u64 = 1_000_000_000;
+    let total_memory = machine.memory_size_bytes();
+    let midpoint = total_memory / 2;
+    let segment_a = MemorySegment {
+        start: 0,
+        end_exclusive: midpoint,
+    };
+    let segment_b = MemorySegment {
+        start: midpoint as u32,
+        end_exclusive: total_memory,
+    };
+
+    assert!(
+        segment_a.as_range().contains(&(layout.program_a.load_base as u64))
+            && segment_a.as_range().contains(&(layout.program_a.entry_pc as u64)),
+        "program A layout must stay within the first half of memory"
+    );
+    assert!(
+        segment_b.as_range().contains(&(layout.program_b.load_base as u64))
+            && segment_b.as_range().contains(&(layout.program_b.entry_pc as u64)),
+        "program B layout must stay within the second half of memory"
+    );
+    assert!(
+        (layout.program_a.load_base as u64) + program_a_bytes.len() as u64 <= segment_a.end_exclusive,
+        "program A binary does not fit within the first half of memory"
+    );
+    assert!(
+        (layout.program_b.load_base as u64) + program_b_bytes.len() as u64 <= segment_b.end_exclusive,
+        "program B binary does not fit within the second half of memory"
+    );
 
     machine.load_binary_at(program_a_bytes, layout.program_a.load_base);
     machine.load_binary_at(program_b_bytes, layout.program_b.load_base);
 
     let mut contexts = [
-        ExecutionContext::new(layout.program_a.entry_pc),
-        ExecutionContext::new(layout.program_b.entry_pc),
+        ExecutionContext::new(layout.program_a.entry_pc, segment_a, SecurityClass::High),
+        ExecutionContext::new(layout.program_b.entry_pc, segment_b, SecurityClass::Low),
     ];
     let mut current = 0usize;
+    machine.set_memory_segment(contexts[current].memory_segment);
+    machine.set_security_class(contexts[current].security_class);
     machine.restore_registers(&contexts[current].registers);
     let mut last_switch_cycle = machine.cycle_count();
 
@@ -73,6 +109,8 @@ pub fn run_dual_flat_binary_bytes(
                     let next = 1 - current;
                     if !contexts[next].exited {
                         current = next;
+                        machine.set_memory_segment(contexts[current].memory_segment);
+                        machine.set_security_class(contexts[current].security_class);
                         machine.restore_registers(&contexts[current].registers);
                         last_switch_cycle = machine.cycle_count();
                     }
@@ -83,6 +121,8 @@ pub fn run_dual_flat_binary_bytes(
                 let next = 1 - current;
                 if !contexts[next].exited {
                     current = next;
+                    machine.set_memory_segment(contexts[current].memory_segment);
+                    machine.set_security_class(contexts[current].security_class);
                     machine.restore_registers(&contexts[current].registers);
                     last_switch_cycle = machine.cycle_count();
                 }
@@ -99,6 +139,8 @@ pub fn run_dual_flat_binary_bytes(
                 let next = 1 - current;
                 if !contexts[next].exited {
                     current = next;
+                    machine.set_memory_segment(contexts[current].memory_segment);
+                    machine.set_security_class(contexts[current].security_class);
                     machine.restore_registers(&contexts[current].registers);
                     last_switch_cycle = machine.cycle_count();
                 }
@@ -170,8 +212,8 @@ mod tests {
                 entry_pc: 0,
             },
             program_b: ProgramLayout {
-                load_base: 0x0001_0000,
-                entry_pc: 0x0001_0000,
+                load_base: 0x8001_0000,
+                entry_pc: 0x8001_0000,
             },
         };
 
@@ -181,5 +223,31 @@ mod tests {
 
         assert_eq!(victim_exit, 0);
         assert_eq!(aggressor_exit, 0);
+    }
+
+    #[test]
+    fn dual_runner_enforces_memory_segments() {
+        let victim = assemble(&[0x0010_0073]);
+        let aggressor = assemble(&[
+            encode_i(0, 0, 0x2, 10, 0x03), // lw a0, 0(x0) -> outside program B segment
+            0x0010_0073,
+        ]);
+        let layout = DualProgramLayout {
+            program_a: ProgramLayout {
+                load_base: 0,
+                entry_pc: 0,
+            },
+            program_b: ProgramLayout {
+                load_base: 0x8001_0000,
+                entry_pc: 0x8001_0000,
+            },
+        };
+
+        let mut machine = RiscV32IntegerMachine::new();
+        let (victim_exit, aggressor_exit) =
+            run_dual_flat_binary_bytes(&mut machine, &victim, &aggressor, layout);
+
+        assert_eq!(victim_exit, 0);
+        assert_eq!(aggressor_exit, -11);
     }
 }
