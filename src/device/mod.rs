@@ -9,4 +9,5 @@ pub trait ContextSwitchListener {
 
 pub mod backcache_memory;
 pub mod memory;
+pub mod newcache_memory;
 pub mod secdcp_memory;

@@ -8,6 +8,7 @@ use crate::device::backcache_memory::{BackCacheMemory, BackCachePolicy};
 use crate::device::memory::{
     CacheTiming, MainMemory, MainMemoryTiming, MemoryDevice, SetAssociativeCache,
 };
+use crate::device::newcache_memory::NewCacheMemory;
 use crate::device::secdcp_memory::{SecDcpMemory, SecurityClass, SecurityClassControl};
 use crate::device::{Clock, ContextSwitchListener};
 use crate::machine::{Machine, StepResult};
@@ -116,6 +117,7 @@ pub struct MemorySegment {
 pub enum MemoryModel {
     Default,
     BackCache,
+    NewCache,
     SecDcp,
 }
 
@@ -282,6 +284,15 @@ impl RiscV32IntegerMachine {
                 ));
                 l2.set_invalidation_listener(backcache_l1);
                 (backcache_l1, None, Some(backcache_l1))
+            }
+            MemoryModel::NewCache => {
+                let newcache_l1: &'static NewCacheMemory<'static> = Box::leak(Box::new(
+                    NewCacheMemory::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2)
+                        .with_clock(clock.clone())
+                        .with_timing(Self::L1_TIMING),
+                ));
+                l2.set_invalidation_listener(newcache_l1);
+                (newcache_l1, Some(newcache_l1), None)
             }
             MemoryModel::SecDcp => {
                 let secdcp_l1: &'static SecDcpMemory<'static> = Box::leak(Box::new(
