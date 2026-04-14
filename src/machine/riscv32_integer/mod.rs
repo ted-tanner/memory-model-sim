@@ -4,11 +4,12 @@ use std::io::Read;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::device::Clock;
+use crate::device::backcache_memory::{BackCacheMemory, BackCachePolicy};
 use crate::device::memory::{
     CacheTiming, MainMemory, MainMemoryTiming, MemoryDevice, SetAssociativeCache,
 };
 use crate::device::secdcp_memory::{SecDcpMemory, SecurityClass, SecurityClassControl};
+use crate::device::{Clock, ContextSwitchListener};
 use crate::machine::{Machine, StepResult};
 
 mod builtins;
@@ -114,6 +115,7 @@ pub struct MemorySegment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryModel {
     Default,
+    BackCache,
     SecDcp,
 }
 
@@ -154,6 +156,7 @@ pub struct RiscV32IntegerMachine {
     builtins: BuiltinMap,
     csrs: CsrBank,
     security_class_control: Option<&'static dyn SecurityClassControl>,
+    context_switch_listener: Option<&'static dyn ContextSwitchListener>,
     security_class: SecurityClass,
     memory_segment: MemorySegment,
     pending_fault_exit_code: Option<i32>,
@@ -256,9 +259,10 @@ impl RiscV32IntegerMachine {
                 .with_clock(clock.clone())
                 .with_timing(Self::L2_TIMING),
         ));
-        let (memory, security_class_control): (
+        let (memory, security_class_control, context_switch_listener): (
             &'static dyn MemoryDevice,
             Option<&'static dyn SecurityClassControl>,
+            Option<&'static dyn ContextSwitchListener>,
         ) = match model {
             MemoryModel::Default => {
                 let l1: &'static SetAssociativeCache<'static> = Box::leak(Box::new(
@@ -267,7 +271,17 @@ impl RiscV32IntegerMachine {
                         .with_timing(Self::L1_TIMING),
                 ));
                 l2.set_invalidation_listener(l1);
-                (l1, None)
+                (l1, None, None)
+            }
+            MemoryModel::BackCache => {
+                let backcache_l1: &'static BackCacheMemory<'static> = Box::leak(Box::new(
+                    BackCacheMemory::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2)
+                        .with_clock(clock.clone())
+                        .with_timing(Self::L1_TIMING)
+                        .with_policy(BackCachePolicy::default()),
+                ));
+                l2.set_invalidation_listener(backcache_l1);
+                (backcache_l1, None, Some(backcache_l1))
             }
             MemoryModel::SecDcp => {
                 let secdcp_l1: &'static SecDcpMemory<'static> = Box::leak(Box::new(
@@ -275,7 +289,7 @@ impl RiscV32IntegerMachine {
                         .with_clock(clock.clone())
                         .with_timing(Self::L1_TIMING),
                 ));
-                (secdcp_l1, Some(secdcp_l1))
+                (secdcp_l1, Some(secdcp_l1), None)
             }
         };
 
@@ -286,6 +300,7 @@ impl RiscV32IntegerMachine {
             builtins: BTreeMap::new(),
             csrs: CsrBank::new(),
             security_class_control,
+            context_switch_listener,
             security_class: SecurityClass::High,
             memory_segment: Self::full_memory_segment(),
             pending_fault_exit_code: None,
@@ -337,6 +352,12 @@ impl RiscV32IntegerMachine {
         self.security_class = class;
         if let Some(control) = self.security_class_control {
             control.set_requester_class(class);
+        }
+    }
+
+    pub fn notify_context_switch(&mut self) {
+        if let Some(listener) = self.context_switch_listener {
+            listener.on_context_switch();
         }
     }
 

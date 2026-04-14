@@ -26,6 +26,7 @@ struct CliConfig {
 fn parse_memory_model(value: &str) -> Result<MemoryModel, String> {
     match value {
         "default" => Ok(MemoryModel::Default),
+        "backcache" => Ok(MemoryModel::BackCache),
         "secdcp" => Ok(MemoryModel::SecDcp),
         _ => Err(format!("unsupported memory model: {value}")),
     }
@@ -68,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(config) => config,
         Err(err) => {
             eprintln!(
-                "Usage: {bin} [--memory-model=default|secdcp] <flat-binary-path> [flat-binary-path-2]"
+                "Usage: {bin} [--memory-model=default|backcache|secdcp] <flat-binary-path> [flat-binary-path-2]"
             );
             return Err(err.into());
         }
@@ -138,6 +139,19 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(config.memory_model, MemoryModel::SecDcp);
+        assert_eq!(config.path_a, "a.bin");
+        assert_eq!(config.path_b.as_deref(), Some("b.bin"));
+    }
+
+    #[test]
+    fn parse_cli_accepts_backcache_memory_model() {
+        let config = parse_cli_args([
+            "--memory-model=backcache".to_string(),
+            "a.bin".to_string(),
+            "b.bin".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(config.memory_model, MemoryModel::BackCache);
         assert_eq!(config.path_a, "a.bin");
         assert_eq!(config.path_b.as_deref(), Some("b.bin"));
     }

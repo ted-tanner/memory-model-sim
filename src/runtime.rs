@@ -106,6 +106,7 @@ pub fn run_dual_flat_binary_bytes(
     let mut current = 0usize;
     machine.set_memory_segment(contexts[current].memory_segment);
     machine.set_security_class(contexts[current].security_class);
+    machine.notify_context_switch();
     machine.restore_registers(&contexts[current].registers);
     let mut last_switch_cycle = machine.cycle_count();
 
@@ -121,6 +122,7 @@ pub fn run_dual_flat_binary_bytes(
                         current = next;
                         machine.set_memory_segment(contexts[current].memory_segment);
                         machine.set_security_class(contexts[current].security_class);
+                        machine.notify_context_switch();
                         machine.restore_registers(&contexts[current].registers);
                         last_switch_cycle = machine.cycle_count();
                     }
@@ -133,6 +135,7 @@ pub fn run_dual_flat_binary_bytes(
                     current = next;
                     machine.set_memory_segment(contexts[current].memory_segment);
                     machine.set_security_class(contexts[current].security_class);
+                    machine.notify_context_switch();
                     machine.restore_registers(&contexts[current].registers);
                     last_switch_cycle = machine.cycle_count();
                 }
@@ -151,6 +154,7 @@ pub fn run_dual_flat_binary_bytes(
                     current = next;
                     machine.set_memory_segment(contexts[current].memory_segment);
                     machine.set_security_class(contexts[current].security_class);
+                    machine.notify_context_switch();
                     machine.restore_registers(&contexts[current].registers);
                     last_switch_cycle = machine.cycle_count();
                 }

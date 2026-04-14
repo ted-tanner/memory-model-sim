@@ -105,6 +105,10 @@ static int hottest_set(void) {
 		}
 	}
 
+	if (best_rounds < (ATTACK_ROUNDS / 2U) || best_total < 8192U) {
+		return -1;
+	}
+
 	return best_set;
 }
 
