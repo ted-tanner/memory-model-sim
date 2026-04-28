@@ -12,6 +12,10 @@ pub enum SecurityClass {
 
 pub trait SecurityClassControl {
     fn set_requester_class(&self, class: SecurityClass);
+
+    fn set_requester_identity(&self, class: SecurityClass, _pid: u32, _domain: u32) {
+        self.set_requester_class(class);
+    }
 }
 
 #[derive(Clone, Copy)]

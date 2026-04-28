@@ -8,6 +8,14 @@ pub const BUILTIN_RANDOM: u32 = 3;
 pub const BUILTIN_YIELD: u32 = 4;
 pub const BUILTIN_MODULO: u32 = 5;
 
+pub const BUILTIN_EXP_GET_PHASE: u32 = 16;
+pub const BUILTIN_EXP_GET_SECRET_SET: u32 = 17;
+pub const BUILTIN_EXP_GET_SECRET_BIT: u32 = 18;
+pub const BUILTIN_EXP_GET_TARGET_SET: u32 = 19;
+pub const BUILTIN_EXP_SUBMIT_VECTOR: u32 = 20;
+pub const BUILTIN_EXP_SUBMIT_SCALAR: u32 = 21;
+pub const BUILTIN_EXP_DONE: u32 = 22;
+
 pub fn register_common_builtins(machine: &mut RiscV32IntegerMachine) {
     machine.register_builtin(BUILTIN_PRINTF, printf);
     machine.register_builtin(BUILTIN_CYCLE_COUNT, cycle_count);

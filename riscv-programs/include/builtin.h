@@ -70,5 +70,89 @@ static inline uint32_t builtin_modulo(uint32_t dividend, uint32_t divisor)
 	return dividend_reg;
 }
 
+#define EXP_PHASE_HALT 0U
+#define EXP_PHASE_PRIME 1U
+#define EXP_PHASE_PROBE 2U
+#define EXP_PHASE_VICTIM_ACCESS 3U
+#define EXP_PHASE_WARM_VICTIM 4U
+#define EXP_PHASE_EVICT_TARGET 5U
+
+static inline uint32_t exp_get_phase(void)
+{
+	register uint32_t out __asm__("a0");
+	__asm__ volatile (
+		"li a7, 16\n"
+		"ecall\n"
+		: "=r"(out)
+		:
+		: "a7"
+	);
+	return out;
+}
+
+static inline uint32_t exp_get_secret_set(void)
+{
+	register uint32_t out __asm__("a0");
+	__asm__ volatile (
+		"li a7, 17\n"
+		"ecall\n"
+		: "=r"(out)
+		:
+		: "a7"
+	);
+	return out;
+}
+
+static inline uint32_t exp_get_secret_bit(void)
+{
+	register uint32_t out __asm__("a0");
+	__asm__ volatile (
+		"li a7, 18\n"
+		"ecall\n"
+		: "=r"(out)
+		:
+		: "a7"
+	);
+	return out;
+}
+
+static inline uint32_t exp_get_target_set(void)
+{
+	register uint32_t out __asm__("a0");
+	__asm__ volatile (
+		"li a7, 19\n"
+		"ecall\n"
+		: "=r"(out)
+		:
+		: "a7"
+	);
+	return out;
+}
+
+static inline void exp_submit_scalar(uint32_t index, uint64_t value)
+{
+	register uint32_t index_reg __asm__("a0") = index;
+	register uint32_t lo __asm__("a1") = (uint32_t)value;
+	register uint32_t hi __asm__("a2") = (uint32_t)(value >> 32);
+	__asm__ volatile (
+		"li a7, 21\n"
+		"ecall\n"
+		:
+		: "r"(index_reg), "r"(lo), "r"(hi)
+		: "a7"
+	);
+}
+
+static inline void exp_done(void)
+{
+	__asm__ volatile (
+		"li a7, 22\n"
+		"ecall\n"
+		:
+		:
+		: "a7"
+	);
+}
+
 #define BUILTIN_H
 #endif

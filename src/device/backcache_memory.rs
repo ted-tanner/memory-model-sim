@@ -1,5 +1,9 @@
 use std::{cell::RefCell, rc::Rc};
 
+use crate::device::cache_trace::{
+    CacheAccessEvent, CacheAccessKind, CacheAccessSource, SharedCacheTrace,
+};
+use crate::device::secdcp_memory::{SecurityClass, SecurityClassControl};
 use crate::device::{Clock, ContextSwitchListener};
 
 use super::memory::{CacheTiming, InvalidationListener, MemoryDevice};
@@ -25,6 +29,9 @@ struct PrimaryLine {
     data: Box<[u8]>,
     dirty: bool,
     last_used: usize,
+    owner: SecurityClass,
+    owner_pid: u32,
+    owner_domain: u32,
 }
 
 #[derive(Clone)]
@@ -34,6 +41,9 @@ struct BackupLine {
     dirty: bool,
     last_used: usize,
     used: bool,
+    owner: SecurityClass,
+    owner_pid: u32,
+    owner_domain: u32,
 }
 
 #[derive(Default)]
@@ -58,6 +68,10 @@ pub struct BackCacheMemory<'a> {
     clock: Option<Rc<Clock>>,
     timing: CacheTiming,
     policy: BackCachePolicy,
+    requester_class: RefCell<SecurityClass>,
+    requester_pid: RefCell<u32>,
+    requester_domain: RefCell<u32>,
+    trace: Option<SharedCacheTrace>,
 }
 
 impl<'a> BackCacheMemory<'a> {
@@ -102,6 +116,10 @@ impl<'a> BackCacheMemory<'a> {
             clock: None,
             timing: CacheTiming::default(),
             policy,
+            requester_class: RefCell::new(SecurityClass::High),
+            requester_pid: RefCell::new(0),
+            requester_domain: RefCell::new(0),
+            trace: None,
         };
         cache.set_enabled_lines(initial_enabled);
         cache
@@ -122,6 +140,11 @@ impl<'a> BackCacheMemory<'a> {
         let enabled = self.random_enabled_count();
         self.set_enabled_lines(enabled);
         *self.resize_countdown.borrow_mut() = enabled;
+        self
+    }
+
+    pub fn with_trace(mut self, trace: SharedCacheTrace) -> Self {
+        self.trace = Some(trace);
         self
     }
 
@@ -182,7 +205,12 @@ impl<'a> BackCacheMemory<'a> {
         addr % self.line_size
     }
 
-    fn fill_line_from_backing(&self, base_addr: usize, last_used: usize) -> PrimaryLine {
+    fn fill_line_from_backing(
+        &self,
+        base_addr: usize,
+        last_used: usize,
+        owner: SecurityClass,
+    ) -> PrimaryLine {
         let mut data = vec![0u8; self.line_size].into_boxed_slice();
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = self.backing_memory.load_u8(base_addr + i);
@@ -192,6 +220,43 @@ impl<'a> BackCacheMemory<'a> {
             data,
             dirty: false,
             last_used,
+            owner,
+            owner_pid: *self.requester_pid.borrow(),
+            owner_domain: *self.requester_domain.borrow(),
+        }
+    }
+
+    fn active_requester(&self) -> SecurityClass {
+        *self.requester_class.borrow()
+    }
+
+    fn record_access(
+        &self,
+        requester: SecurityClass,
+        kind: CacheAccessKind,
+        addr: usize,
+        hit: bool,
+        source: CacheAccessSource,
+        evicted_line: Option<&PrimaryLine>,
+    ) {
+        if let Some(trace) = &self.trace {
+            trace.record(CacheAccessEvent {
+                architecture: "backcache",
+                requester,
+                requester_pid: *self.requester_pid.borrow(),
+                requester_domain: *self.requester_domain.borrow(),
+                kind,
+                addr,
+                set: Some(self.set_index(addr)),
+                hit,
+                source,
+                evicted_owner: evicted_line.map(|line| line.owner),
+                evicted_pid: evicted_line.map(|line| line.owner_pid),
+                evicted_domain: evicted_line.map(|line| line.owner_domain),
+                evicted_addr: evicted_line.map(|line| line.base_addr),
+                slice: None,
+                writebacks: evicted_line.is_some_and(|line| line.dirty) as u64,
+            });
         }
     }
 
@@ -340,6 +405,9 @@ impl<'a> BackCacheMemory<'a> {
                 dirty: line.dirty,
                 last_used,
                 used: false,
+                owner: line.owner,
+                owner_pid: line.owner_pid,
+                owner_domain: line.owner_domain,
             });
             return;
         }
@@ -362,6 +430,9 @@ impl<'a> BackCacheMemory<'a> {
             dirty: line.dirty,
             last_used,
             used: false,
+            owner: line.owner,
+            owner_pid: line.owner_pid,
+            owner_domain: line.owner_domain,
         });
     }
 
@@ -475,6 +546,7 @@ impl<'a> BackCacheMemory<'a> {
     }
 
     fn load_u8_internal(&self, addr: usize, charge_timing: bool) -> u8 {
+        let requester = self.active_requester();
         let base_addr = self.line_base(addr);
         let set_idx = self.set_index(addr);
         let offset = self.offset_in_line(addr);
@@ -497,6 +569,14 @@ impl<'a> BackCacheMemory<'a> {
             if charge_timing {
                 self.tick(self.timing.load_hit);
             }
+            self.record_access(
+                requester,
+                CacheAccessKind::Load,
+                addr,
+                true,
+                CacheAccessSource::L1D,
+                None,
+            );
             self.access_complete();
             return byte;
         }
@@ -516,32 +596,52 @@ impl<'a> BackCacheMemory<'a> {
                 data: backup_line.data.clone(),
                 dirty: backup_line.dirty,
                 last_used: use_count,
+                owner: backup_line.owner,
+                owner_pid: backup_line.owner_pid,
+                owner_domain: backup_line.owner_domain,
             });
-            if let Some(line) = evicted {
-                self.insert_primary_eviction_into_backup(line);
+            if let Some(line) = evicted.as_ref() {
+                self.insert_primary_eviction_into_backup(line.clone());
             }
 
             if charge_timing {
                 self.tick(self.timing.load_hit);
             }
+            self.record_access(
+                requester,
+                CacheAccessKind::Load,
+                addr,
+                true,
+                CacheAccessSource::BackCache,
+                evicted.as_ref(),
+            );
             self.access_complete();
             return byte;
         }
 
-        let new_line = self.fill_line_from_backing(base_addr, use_count);
+        let new_line = self.fill_line_from_backing(base_addr, use_count, requester);
         let byte = new_line.data[offset];
         let evicted = self.install_primary_line(new_line);
-        if let Some(line) = evicted {
-            self.insert_primary_eviction_into_backup(line);
+        if let Some(line) = evicted.as_ref() {
+            self.insert_primary_eviction_into_backup(line.clone());
         }
         if charge_timing {
             self.tick(self.timing.load_miss);
         }
+        self.record_access(
+            requester,
+            CacheAccessKind::Load,
+            addr,
+            false,
+            CacheAccessSource::Lower,
+            evicted.as_ref(),
+        );
         self.access_complete();
         byte
     }
 
     fn store_u8_internal(&self, addr: usize, value: u8, charge_timing: bool) {
+        let requester = self.active_requester();
         let base_addr = self.line_base(addr);
         let set_idx = self.set_index(addr);
         let offset = self.offset_in_line(addr);
@@ -568,10 +668,19 @@ impl<'a> BackCacheMemory<'a> {
             if charge_timing {
                 self.tick(self.timing.store_hit);
             }
+            self.record_access(
+                requester,
+                CacheAccessKind::Store,
+                addr,
+                true,
+                CacheAccessSource::L1D,
+                None,
+            );
             self.access_complete();
             return;
         }
 
+        let had_backup = self.find_backup_slot(base_addr).is_some();
         let mut refill = if let Some(slot_idx) = self.find_backup_slot(base_addr) {
             let mut backup = self.backup.borrow_mut();
             let line = backup[slot_idx].line.as_mut().unwrap();
@@ -581,7 +690,7 @@ impl<'a> BackCacheMemory<'a> {
             line.used = true;
             line.clone()
         } else {
-            let mut line = self.fill_line_from_backing(base_addr, use_count);
+            let mut line = self.fill_line_from_backing(base_addr, use_count, requester);
             line.data[offset] = value;
             line.dirty = true;
             BackupLine {
@@ -590,6 +699,9 @@ impl<'a> BackCacheMemory<'a> {
                 dirty: line.dirty,
                 last_used: line.last_used,
                 used: false,
+                owner: line.owner,
+                owner_pid: line.owner_pid,
+                owner_domain: line.owner_domain,
             }
         };
 
@@ -599,19 +711,34 @@ impl<'a> BackCacheMemory<'a> {
             data: refill.data.clone(),
             dirty: refill.dirty,
             last_used: use_count,
+            owner: refill.owner,
+            owner_pid: refill.owner_pid,
+            owner_domain: refill.owner_domain,
         });
-        if let Some(line) = evicted {
-            self.insert_primary_eviction_into_backup(line);
+        if let Some(line) = evicted.as_ref() {
+            self.insert_primary_eviction_into_backup(line.clone());
         }
 
         if charge_timing {
-            let timing = if self.find_backup_slot(base_addr).is_some() {
+            let timing = if had_backup {
                 self.timing.store_hit
             } else {
                 self.timing.store_miss
             };
             self.tick(timing);
         }
+        self.record_access(
+            requester,
+            CacheAccessKind::Store,
+            addr,
+            had_backup,
+            if had_backup {
+                CacheAccessSource::BackCache
+            } else {
+                CacheAccessSource::Lower
+            },
+            evicted.as_ref(),
+        );
         self.access_complete();
     }
 
@@ -639,6 +766,18 @@ impl<'a> BackCacheMemory<'a> {
 impl<'a> ContextSwitchListener for BackCacheMemory<'a> {
     fn on_context_switch(&self) {
         self.clear_backup_used_bits();
+    }
+}
+
+impl<'a> SecurityClassControl for BackCacheMemory<'a> {
+    fn set_requester_class(&self, class: SecurityClass) {
+        *self.requester_class.borrow_mut() = class;
+    }
+
+    fn set_requester_identity(&self, class: SecurityClass, pid: u32, domain: u32) {
+        *self.requester_class.borrow_mut() = class;
+        *self.requester_pid.borrow_mut() = pid;
+        *self.requester_domain.borrow_mut() = domain;
     }
 }
 

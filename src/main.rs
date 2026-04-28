@@ -1,5 +1,10 @@
 use std::path::Path;
 
+use memory_model_sim::experiment::{
+    AttackKind, ControlMode, DEFAULT_DECOY_SET, DEFAULT_TARGET_SET, DomainMode, ExperimentConfig,
+    ScheduleMode, parse_attack_kind, parse_control_mode, parse_domain_mode, parse_schedule_mode,
+    run_experiment,
+};
 use memory_model_sim::machine::{Machine, MemoryModel, RiscV32IntegerMachine};
 use memory_model_sim::runtime::{
     DualProgramLayout, ProgramLayout, run_dual_flat_binary_files, run_flat_binary_file,
@@ -26,11 +31,93 @@ struct CliConfig {
 fn parse_memory_model(value: &str) -> Result<MemoryModel, String> {
     match value {
         "default" => Ok(MemoryModel::Default),
+        "smtcache" => Ok(MemoryModel::SmtCache),
         "backcache" => Ok(MemoryModel::BackCache),
         "newcache" => Ok(MemoryModel::NewCache),
         "secdcp" => Ok(MemoryModel::SecDcp),
         _ => Err(format!("unsupported memory model: {value}")),
     }
+}
+
+fn default_experiment_path(name: &str) -> String {
+    format!("riscv-programs/{name}/firmware.bin")
+}
+
+fn parse_experiment_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<ExperimentConfig, String> {
+    let mut attack = AttackKind::BinaryPrimeProbe;
+    let mut schedule_mode = ScheduleMode::TimeSliced;
+    let mut memory_model = MemoryModel::Default;
+    let mut domain_mode = DomainMode::Different;
+    let mut control = ControlMode::None;
+    let mut trials = 16_384usize;
+    let mut seed = 1u64;
+    let mut target_set = DEFAULT_TARGET_SET;
+    let mut decoy_set = DEFAULT_DECOY_SET;
+    let mut attacker_path = default_experiment_path("l1d-attacker");
+    let mut victim_path = default_experiment_path("l1d-victim");
+    let mut out_dir = "results/l1d-experiment".to_string();
+
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--attack=") {
+            attack = parse_attack_kind(value)?;
+        } else if let Some(value) = arg.strip_prefix("--mode=") {
+            schedule_mode = parse_schedule_mode(value)?;
+        } else if let Some(value) = arg.strip_prefix("--memory-model=") {
+            memory_model = parse_memory_model(value)?;
+        } else if let Some(value) = arg.strip_prefix("--domains=") {
+            domain_mode = parse_domain_mode(value)?;
+        } else if let Some(value) = arg.strip_prefix("--control=") {
+            control = parse_control_mode(value)?;
+        } else if let Some(value) = arg.strip_prefix("--trials=") {
+            trials = value
+                .parse()
+                .map_err(|_| format!("invalid --trials value: {value}"))?;
+        } else if let Some(value) = arg.strip_prefix("--seed=") {
+            seed = value
+                .parse()
+                .map_err(|_| format!("invalid --seed value: {value}"))?;
+        } else if let Some(value) = arg.strip_prefix("--target-set=") {
+            target_set = value
+                .parse()
+                .map_err(|_| format!("invalid --target-set value: {value}"))?;
+        } else if let Some(value) = arg.strip_prefix("--decoy-set=") {
+            decoy_set = value
+                .parse()
+                .map_err(|_| format!("invalid --decoy-set value: {value}"))?;
+        } else if let Some(value) = arg.strip_prefix("--attacker=") {
+            attacker_path = value.to_string();
+        } else if let Some(value) = arg.strip_prefix("--victim=") {
+            victim_path = value.to_string();
+        } else if let Some(value) = arg.strip_prefix("--out=") {
+            out_dir = value.to_string();
+        } else {
+            return Err(format!("unsupported experiment argument: {arg}"));
+        }
+    }
+
+    if target_set >= 64 {
+        return Err("--target-set must be in 0..64".to_string());
+    }
+    if decoy_set >= 64 {
+        return Err("--decoy-set must be in 0..64".to_string());
+    }
+
+    Ok(ExperimentConfig {
+        attack,
+        schedule_mode,
+        memory_model,
+        domain_mode,
+        control,
+        trials,
+        seed,
+        target_set,
+        decoy_set,
+        attacker_path: attacker_path.into(),
+        victim_path: victim_path.into(),
+        out_dir: out_dir.into(),
+    })
 }
 
 fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<CliConfig, String> {
@@ -66,11 +153,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .unwrap_or_else(|| "memory-model-sim".to_string());
 
-    let config = match parse_cli_args(args) {
+    let rest = args.collect::<Vec<_>>();
+    if rest.first().is_some_and(|arg| arg == "experiment") {
+        let config = match parse_experiment_args(rest.into_iter().skip(1)) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!(
+                    "Usage: {bin} experiment [--attack=binary-pp|prime-probe|evict-time] [--mode=time-sliced|smt] [--memory-model=default|smtcache|backcache|newcache|secdcp] [--domains=different|same] [--trials=N] [--seed=N] [--out=DIR]"
+                );
+                return Err(err.into());
+            }
+        };
+        run_experiment(&config)?;
+        println!(
+            "emulator: Experiment results written to {}",
+            config.out_dir.display()
+        );
+        return Ok(());
+    }
+
+    let config = match parse_cli_args(rest) {
         Ok(config) => config,
         Err(err) => {
             eprintln!(
-                "Usage: {bin} [--memory-model=default|backcache|newcache|secdcp] <flat-binary-path> [flat-binary-path-2]"
+                "Usage: {bin} [--memory-model=default|smtcache|backcache|newcache|secdcp] <flat-binary-path> [flat-binary-path-2]"
             );
             return Err(err.into());
         }
@@ -155,6 +261,17 @@ mod tests {
         assert_eq!(config.memory_model, MemoryModel::BackCache);
         assert_eq!(config.path_a, "a.bin");
         assert_eq!(config.path_b.as_deref(), Some("b.bin"));
+    }
+
+    #[test]
+    fn parse_cli_accepts_smtcache_memory_model() {
+        let config = parse_cli_args([
+            "--memory-model=smtcache".to_string(),
+            "a.bin".to_string(),
+            "b.bin".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(config.memory_model, MemoryModel::SmtCache);
     }
 
     #[test]

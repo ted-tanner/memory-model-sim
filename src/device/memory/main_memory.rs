@@ -134,6 +134,15 @@ impl MemoryDevice for MainMemory {
         self.tick_store();
         self.buf.borrow_mut()[addr..addr + 4].copy_from_slice(&n.to_le_bytes());
     }
+
+    fn debug_load_u8_no_timing(&self, addr: usize) -> u8 {
+        self.buf.borrow()[addr]
+    }
+
+    fn debug_load_u32_no_timing(&self, addr: usize) -> u32 {
+        let b = self.buf.borrow();
+        u32::from_le_bytes([b[addr], b[addr + 1], b[addr + 2], b[addr + 3]])
+    }
 }
 
 #[cfg(test)]

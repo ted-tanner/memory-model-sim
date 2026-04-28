@@ -26,6 +26,22 @@ pub trait MemoryDevice {
     fn backing_memory(&self) -> Option<&dyn MemoryDevice> {
         None
     }
+
+    fn debug_load_u8_no_timing(&self, addr: usize) -> u8 {
+        if let Some(backing) = self.backing_memory() {
+            backing.debug_load_u8_no_timing(addr)
+        } else {
+            self.load_u8(addr)
+        }
+    }
+
+    fn debug_load_u32_no_timing(&self, addr: usize) -> u32 {
+        let b0 = self.debug_load_u8_no_timing(addr);
+        let b1 = self.debug_load_u8_no_timing(addr + 1);
+        let b2 = self.debug_load_u8_no_timing(addr + 2);
+        let b3 = self.debug_load_u8_no_timing(addr + 3);
+        u32::from_le_bytes([b0, b1, b2, b3])
+    }
 }
 
 mod set_associative_cache;

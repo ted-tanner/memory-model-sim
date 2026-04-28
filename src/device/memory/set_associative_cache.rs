@@ -1,6 +1,10 @@
 use std::{cell::RefCell, rc::Rc};
 
 use crate::device::Clock;
+use crate::device::cache_trace::{
+    CacheAccessEvent, CacheAccessKind, CacheAccessSource, SharedCacheTrace,
+};
+use crate::device::secdcp_memory::{SecurityClass, SecurityClassControl};
 
 use super::{InvalidationListener, MemoryDevice};
 
@@ -9,6 +13,9 @@ struct CacheLine {
     data: Box<[u8]>,
     dirty: bool,
     last_used: usize,
+    owner: SecurityClass,
+    owner_pid: u32,
+    owner_domain: u32,
 }
 
 type CacheSets = Box<[Box<[Option<CacheLine>]>]>;
@@ -48,6 +55,10 @@ pub struct SetAssociativeCache<'a> {
     clock: Option<Rc<Clock>>,
     timing: CacheTiming,
     invalidation_listener: RefCell<Option<&'a dyn InvalidationListener>>,
+    requester_class: RefCell<SecurityClass>,
+    requester_pid: RefCell<u32>,
+    requester_domain: RefCell<u32>,
+    trace: Option<SharedCacheTrace>,
 }
 
 impl<'a> SetAssociativeCache<'a> {
@@ -79,6 +90,10 @@ impl<'a> SetAssociativeCache<'a> {
             clock: None,
             timing: CacheTiming::default(),
             invalidation_listener: RefCell::new(None),
+            requester_class: RefCell::new(SecurityClass::High),
+            requester_pid: RefCell::new(0),
+            requester_domain: RefCell::new(0),
+            trace: None,
         }
     }
 
@@ -89,6 +104,11 @@ impl<'a> SetAssociativeCache<'a> {
 
     pub fn with_timing(mut self, timing: CacheTiming) -> Self {
         self.timing = timing;
+        self
+    }
+
+    pub fn with_trace(mut self, trace: SharedCacheTrace) -> Self {
+        self.trace = Some(trace);
         self
     }
 
@@ -124,7 +144,12 @@ impl<'a> SetAssociativeCache<'a> {
         }
     }
 
-    fn fill_line_from_backing(&self, base_addr: usize, last_used: usize) -> CacheLine {
+    fn fill_line_from_backing(
+        &self,
+        base_addr: usize,
+        last_used: usize,
+        owner: SecurityClass,
+    ) -> CacheLine {
         let mut data = vec![0u8; self.line_size].into_boxed_slice();
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = self.backing_memory.load_u8(base_addr + i);
@@ -134,6 +159,46 @@ impl<'a> SetAssociativeCache<'a> {
             data,
             dirty: false,
             last_used,
+            owner,
+            owner_pid: *self.requester_pid.borrow(),
+            owner_domain: *self.requester_domain.borrow(),
+        }
+    }
+
+    fn active_requester(&self) -> SecurityClass {
+        *self.requester_class.borrow()
+    }
+
+    fn record_access(
+        &self,
+        requester: SecurityClass,
+        kind: CacheAccessKind,
+        addr: usize,
+        hit: bool,
+        evicted_line: Option<&CacheLine>,
+    ) {
+        if let Some(trace) = &self.trace {
+            trace.record(CacheAccessEvent {
+                architecture: "default",
+                requester,
+                requester_pid: *self.requester_pid.borrow(),
+                requester_domain: *self.requester_domain.borrow(),
+                kind,
+                addr,
+                set: Some(self.set_index(addr)),
+                hit,
+                source: if hit {
+                    CacheAccessSource::L1D
+                } else {
+                    CacheAccessSource::Lower
+                },
+                evicted_owner: evicted_line.map(|line| line.owner),
+                evicted_pid: evicted_line.map(|line| line.owner_pid),
+                evicted_domain: evicted_line.map(|line| line.owner_domain),
+                evicted_addr: evicted_line.map(|line| line.base_addr),
+                slice: None,
+                writebacks: evicted_line.is_some_and(|line| line.dirty) as u64,
+            });
         }
     }
 
@@ -164,6 +229,7 @@ impl<'a> SetAssociativeCache<'a> {
     }
 
     fn load_u8_internal(&self, addr: usize, charge_access_timing: bool) -> u8 {
+        let requester = self.active_requester();
         let set_idx = self.set_index(addr);
         let base = self.line_base(addr);
         let offset = self.offset_in_line(addr);
@@ -181,6 +247,7 @@ impl<'a> SetAssociativeCache<'a> {
                     if charge_access_timing {
                         self.tick(self.timing.load_hit);
                     }
+                    self.record_access(requester, CacheAccessKind::Load, addr, true, None);
                     return set[way].as_ref().unwrap().data[offset];
                 }
             }
@@ -203,7 +270,7 @@ impl<'a> SetAssociativeCache<'a> {
             self.tick(self.timing.invalidation_send);
         }
 
-        let new_line = self.fill_line_from_backing(base, use_count);
+        let new_line = self.fill_line_from_backing(base, use_count, requester);
         let byte = new_line.data[offset];
         {
             let mut cache = self.cache.borrow_mut();
@@ -212,10 +279,18 @@ impl<'a> SetAssociativeCache<'a> {
         if charge_access_timing {
             self.tick(self.timing.load_miss);
         }
+        self.record_access(
+            requester,
+            CacheAccessKind::Load,
+            addr,
+            false,
+            evicted_line.as_ref(),
+        );
         byte
     }
 
     fn store_u8_internal(&self, addr: usize, n: u8, charge_access_timing: bool) {
+        let requester = self.active_requester();
         let set_idx = self.set_index(addr);
         let base = self.line_base(addr);
         let offset = self.offset_in_line(addr);
@@ -235,6 +310,7 @@ impl<'a> SetAssociativeCache<'a> {
                     if charge_access_timing {
                         self.tick(self.timing.store_hit);
                     }
+                    self.record_access(requester, CacheAccessKind::Store, addr, true, None);
                     return;
                 }
             }
@@ -257,7 +333,7 @@ impl<'a> SetAssociativeCache<'a> {
             self.tick(self.timing.invalidation_send);
         }
 
-        let mut new_line = self.fill_line_from_backing(base, use_count);
+        let mut new_line = self.fill_line_from_backing(base, use_count, requester);
         new_line.data[offset] = n;
         new_line.dirty = true;
         {
@@ -267,6 +343,25 @@ impl<'a> SetAssociativeCache<'a> {
         if charge_access_timing {
             self.tick(self.timing.store_miss);
         }
+        self.record_access(
+            requester,
+            CacheAccessKind::Store,
+            addr,
+            false,
+            evicted_line.as_ref(),
+        );
+    }
+}
+
+impl<'a> SecurityClassControl for SetAssociativeCache<'a> {
+    fn set_requester_class(&self, class: SecurityClass) {
+        *self.requester_class.borrow_mut() = class;
+    }
+
+    fn set_requester_identity(&self, class: SecurityClass, pid: u32, domain: u32) {
+        *self.requester_class.borrow_mut() = class;
+        *self.requester_pid.borrow_mut() = pid;
+        *self.requester_domain.borrow_mut() = domain;
     }
 }
 

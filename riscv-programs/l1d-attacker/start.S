@@ -1,0 +1,7 @@
+.section .text.init
+.global _start
+
+_start:
+    li sp, 0x300080
+    call main
+    ebreak

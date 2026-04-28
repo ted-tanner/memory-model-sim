@@ -1,6 +1,9 @@
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use crate::device::Clock;
+use crate::device::cache_trace::{
+    CacheAccessEvent, CacheAccessKind, CacheAccessSource, SharedCacheTrace,
+};
 
 use super::memory::{CacheTiming, InvalidationListener, MemoryDevice};
 use super::secdcp_memory::{SecurityClass, SecurityClassControl};
@@ -12,6 +15,8 @@ struct CacheLine {
     dirty: bool,
     last_used: usize,
     owner: SecurityClass,
+    owner_pid: u32,
+    owner_domain: u32,
 }
 
 #[derive(Default)]
@@ -25,11 +30,14 @@ pub struct NewCacheMemory<'a> {
     cache: RefCell<Box<[Option<CacheLine>]>>,
     domains: RefCell<[DomainState; 2]>,
     active_domain: RefCell<SecurityClass>,
+    requester_pid: RefCell<u32>,
+    requester_domain_id: RefCell<u32>,
     use_counter: RefCell<usize>,
     rng_state: RefCell<u64>,
     backing_memory: &'a dyn MemoryDevice,
     clock: Option<Rc<Clock>>,
     timing: CacheTiming,
+    trace: Option<SharedCacheTrace>,
 }
 
 impl<'a> NewCacheMemory<'a> {
@@ -53,11 +61,14 @@ impl<'a> NewCacheMemory<'a> {
             cache: RefCell::new(cache),
             domains: RefCell::new([DomainState::default(), DomainState::default()]),
             active_domain: RefCell::new(SecurityClass::High),
+            requester_pid: RefCell::new(0),
+            requester_domain_id: RefCell::new(0),
             use_counter: RefCell::new(0),
             rng_state: RefCell::new(0x6e65_7763_6163_6865),
             backing_memory,
             clock: None,
             timing: CacheTiming::default(),
+            trace: None,
         }
     }
 
@@ -68,6 +79,11 @@ impl<'a> NewCacheMemory<'a> {
 
     pub fn with_timing(mut self, timing: CacheTiming) -> Self {
         self.timing = timing;
+        self
+    }
+
+    pub fn with_trace(mut self, trace: SharedCacheTrace) -> Self {
+        self.trace = Some(trace);
         self
     }
 
@@ -123,6 +139,8 @@ impl<'a> NewCacheMemory<'a> {
             dirty: false,
             last_used: self.next_use_counter(),
             owner,
+            owner_pid: *self.requester_pid.borrow(),
+            owner_domain: *self.requester_domain_id.borrow(),
         }
     }
 
@@ -173,7 +191,7 @@ impl<'a> NewCacheMemory<'a> {
         }
     }
 
-    fn install_line(&self, idx: usize, line: CacheLine) {
+    fn install_line(&self, idx: usize, line: CacheLine) -> Option<CacheLine> {
         let evicted = {
             let mut cache = self.cache.borrow_mut();
             let old = cache[idx].take();
@@ -181,13 +199,13 @@ impl<'a> NewCacheMemory<'a> {
             old
         };
 
-        if let Some(old_line) = evicted {
+        if let Some(old_line) = evicted.as_ref() {
             let owner_idx = Self::domain_index(old_line.owner);
             self.domains.borrow_mut()[owner_idx]
                 .mapping
                 .remove(&old_line.base_addr);
             if old_line.dirty {
-                self.write_back_line(&old_line);
+                self.write_back_line(old_line);
                 self.tick(self.timing.write_back);
             }
         }
@@ -196,6 +214,41 @@ impl<'a> NewCacheMemory<'a> {
         self.domains.borrow_mut()[owner_idx]
             .mapping
             .insert(line.base_addr, idx);
+        evicted
+    }
+
+    fn record_access(
+        &self,
+        requester: SecurityClass,
+        kind: CacheAccessKind,
+        addr: usize,
+        hit: bool,
+        slot: Option<usize>,
+        evicted_line: Option<&CacheLine>,
+    ) {
+        if let Some(trace) = &self.trace {
+            trace.record(CacheAccessEvent {
+                architecture: "newcache",
+                requester,
+                requester_pid: *self.requester_pid.borrow(),
+                requester_domain: *self.requester_domain_id.borrow(),
+                kind,
+                addr,
+                set: slot,
+                hit,
+                source: if hit {
+                    CacheAccessSource::L1D
+                } else {
+                    CacheAccessSource::Lower
+                },
+                evicted_owner: evicted_line.map(|line| line.owner),
+                evicted_pid: evicted_line.map(|line| line.owner_pid),
+                evicted_domain: evicted_line.map(|line| line.owner_domain),
+                evicted_addr: evicted_line.map(|line| line.base_addr),
+                slice: None,
+                writebacks: evicted_line.is_some_and(|line| line.dirty) as u64,
+            });
+        }
     }
 
     fn load_u8_internal(&self, addr: usize, charge_access_timing: bool) -> u8 {
@@ -213,16 +266,33 @@ impl<'a> NewCacheMemory<'a> {
             if charge_access_timing {
                 self.tick(self.timing.load_hit);
             }
+            self.record_access(
+                self.active_domain(),
+                CacheAccessKind::Load,
+                addr,
+                true,
+                Some(idx),
+                None,
+            );
             return byte;
         }
 
+        let owner = self.active_domain();
         let line = self.fill_line_from_backing(base_addr, self.active_domain());
         let byte = line.data[offset];
         let idx = self.choose_install_index();
-        self.install_line(idx, line);
+        let evicted = self.install_line(idx, line);
         if charge_access_timing {
             self.tick(self.timing.load_miss);
         }
+        self.record_access(
+            owner,
+            CacheAccessKind::Load,
+            addr,
+            false,
+            Some(idx),
+            evicted.as_ref(),
+        );
         byte
     }
 
@@ -242,17 +312,34 @@ impl<'a> NewCacheMemory<'a> {
             if charge_access_timing {
                 self.tick(self.timing.store_hit);
             }
+            self.record_access(
+                self.active_domain(),
+                CacheAccessKind::Store,
+                addr,
+                true,
+                Some(idx),
+                None,
+            );
             return;
         }
 
+        let owner = self.active_domain();
         let mut line = self.fill_line_from_backing(base_addr, self.active_domain());
         line.dirty = true;
         line.data[offset] = value;
         let idx = self.choose_install_index();
-        self.install_line(idx, line);
+        let evicted = self.install_line(idx, line);
         if charge_access_timing {
             self.tick(self.timing.store_miss);
         }
+        self.record_access(
+            owner,
+            CacheAccessKind::Store,
+            addr,
+            false,
+            Some(idx),
+            evicted.as_ref(),
+        );
     }
 
     #[cfg(test)]
@@ -268,6 +355,12 @@ impl<'a> NewCacheMemory<'a> {
 impl<'a> SecurityClassControl for NewCacheMemory<'a> {
     fn set_requester_class(&self, class: SecurityClass) {
         *self.active_domain.borrow_mut() = class;
+    }
+
+    fn set_requester_identity(&self, class: SecurityClass, pid: u32, domain: u32) {
+        *self.active_domain.borrow_mut() = class;
+        *self.requester_pid.borrow_mut() = pid;
+        *self.requester_domain_id.borrow_mut() = domain;
     }
 }
 

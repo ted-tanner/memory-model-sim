@@ -5,15 +5,17 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::device::backcache_memory::{BackCacheMemory, BackCachePolicy};
+use crate::device::cache_trace::SharedCacheTrace;
 use crate::device::memory::{
     CacheTiming, MainMemory, MainMemoryTiming, MemoryDevice, SetAssociativeCache,
 };
 use crate::device::newcache_memory::NewCacheMemory;
 use crate::device::secdcp_memory::{SecDcpMemory, SecurityClass, SecurityClassControl};
+use crate::device::smtcache_memory::SmtCacheMemory;
 use crate::device::{Clock, ContextSwitchListener};
 use crate::machine::{Machine, StepResult};
 
-mod builtins;
+pub(crate) mod builtins;
 
 #[derive(Clone)]
 pub struct Registers {
@@ -116,6 +118,7 @@ pub struct MemorySegment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryModel {
     Default,
+    SmtCache,
     BackCache,
     NewCache,
     SecDcp,
@@ -162,6 +165,7 @@ pub struct RiscV32IntegerMachine {
     security_class: SecurityClass,
     memory_segment: MemorySegment,
     pending_fault_exit_code: Option<i32>,
+    model_instruction_fetch: bool,
 }
 
 impl RiscV32IntegerMachine {
@@ -243,6 +247,13 @@ impl RiscV32IntegerMachine {
     }
 
     pub fn with_memory_model(model: MemoryModel) -> Self {
+        Self::with_memory_model_and_trace(model, None)
+    }
+
+    pub fn with_memory_model_and_trace(
+        model: MemoryModel,
+        trace: Option<SharedCacheTrace>,
+    ) -> Self {
         let memory_size = Self::DEFAULT_MEMORY_SIZE;
         let clock = Rc::new(Clock::new());
 
@@ -267,30 +278,54 @@ impl RiscV32IntegerMachine {
             Option<&'static dyn ContextSwitchListener>,
         ) = match model {
             MemoryModel::Default => {
-                let l1: &'static SetAssociativeCache<'static> = Box::leak(Box::new(
+                let mut l1 =
                     SetAssociativeCache::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2)
                         .with_clock(clock.clone())
-                        .with_timing(Self::L1_TIMING),
-                ));
+                        .with_timing(Self::L1_TIMING);
+                if let Some(trace) = trace.clone() {
+                    l1 = l1.with_trace(trace);
+                }
+                let l1: &'static SetAssociativeCache<'static> = Box::leak(Box::new(l1));
                 l2.set_invalidation_listener(l1);
-                (l1, None, None)
+                (l1, Some(l1), None)
+            }
+            MemoryModel::SmtCache => {
+                let mut smtcache_l1 =
+                    SmtCacheMemory::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, 2, l2)
+                        .with_clock(clock.clone())
+                        .with_timing(Self::L1_TIMING);
+                if let Some(trace) = trace.clone() {
+                    smtcache_l1 = smtcache_l1.with_trace(trace);
+                }
+                let smtcache_l1: &'static SmtCacheMemory<'static> =
+                    Box::leak(Box::new(smtcache_l1));
+                l2.set_invalidation_listener(smtcache_l1);
+                (smtcache_l1, Some(smtcache_l1), None)
             }
             MemoryModel::BackCache => {
-                let backcache_l1: &'static BackCacheMemory<'static> = Box::leak(Box::new(
+                let mut backcache_l1 =
                     BackCacheMemory::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2)
                         .with_clock(clock.clone())
                         .with_timing(Self::L1_TIMING)
-                        .with_policy(BackCachePolicy::default()),
-                ));
+                        .with_policy(BackCachePolicy::default());
+                if let Some(trace) = trace.clone() {
+                    backcache_l1 = backcache_l1.with_trace(trace);
+                }
+                let backcache_l1: &'static BackCacheMemory<'static> =
+                    Box::leak(Box::new(backcache_l1));
                 l2.set_invalidation_listener(backcache_l1);
-                (backcache_l1, None, Some(backcache_l1))
+                (backcache_l1, Some(backcache_l1), Some(backcache_l1))
             }
             MemoryModel::NewCache => {
-                let newcache_l1: &'static NewCacheMemory<'static> = Box::leak(Box::new(
+                let mut newcache_l1 =
                     NewCacheMemory::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2)
                         .with_clock(clock.clone())
-                        .with_timing(Self::L1_TIMING),
-                ));
+                        .with_timing(Self::L1_TIMING);
+                if let Some(trace) = trace.clone() {
+                    newcache_l1 = newcache_l1.with_trace(trace);
+                }
+                let newcache_l1: &'static NewCacheMemory<'static> =
+                    Box::leak(Box::new(newcache_l1));
                 l2.set_invalidation_listener(newcache_l1);
                 (newcache_l1, Some(newcache_l1), None)
             }
@@ -315,6 +350,7 @@ impl RiscV32IntegerMachine {
             security_class: SecurityClass::High,
             memory_segment: Self::full_memory_segment(),
             pending_fault_exit_code: None,
+            model_instruction_fetch: true,
         };
         builtins::register_common_builtins(&mut machine);
         machine.set_security_class(SecurityClass::High);
@@ -366,6 +402,13 @@ impl RiscV32IntegerMachine {
         }
     }
 
+    pub fn set_requester_identity(&mut self, class: SecurityClass, pid: u32, domain: u32) {
+        self.security_class = class;
+        if let Some(control) = self.security_class_control {
+            control.set_requester_identity(class, pid, domain);
+        }
+    }
+
     pub fn notify_context_switch(&mut self) {
         if let Some(listener) = self.context_switch_listener {
             listener.on_context_switch();
@@ -374,6 +417,10 @@ impl RiscV32IntegerMachine {
 
     pub fn security_class(&self) -> SecurityClass {
         self.security_class
+    }
+
+    pub fn set_model_instruction_fetch(&mut self, model_instruction_fetch: bool) {
+        self.model_instruction_fetch = model_instruction_fetch;
     }
 
     pub fn register_builtin(&mut self, number: u32, f: impl FnMut(&mut Self) + 'static) {
@@ -440,6 +487,17 @@ impl RiscV32IntegerMachine {
             self.memory.load_u32(addr as usize)
         } else {
             0
+        }
+    }
+
+    fn fetch_instruction_u32(&mut self, addr: u32) -> u32 {
+        if !self.ensure_segment_access(addr, 4) {
+            return 0;
+        }
+        if self.model_instruction_fetch {
+            self.memory.load_u32(addr as usize)
+        } else {
+            self.memory.debug_load_u32_no_timing(addr as usize)
         }
     }
     pub fn store_u8(&mut self, addr: u32, v: u8) {
@@ -509,17 +567,14 @@ impl RiscV32IntegerMachine {
 
     fn instruction_cycles(instruction: u32, result: &StepResult) -> u64 {
         match instruction & 0x7f {
-            Self::OP_OP => {
-                if ((instruction >> 25) & 0x7f) == 0x01 {
-                    if ((instruction >> 12) & 0x7) < 4 {
-                        4
-                    } else {
-                        20
-                    }
+            Self::OP_OP if ((instruction >> 25) & 0x7f) == 0x01 => {
+                if ((instruction >> 12) & 0x7) < 4 {
+                    4
                 } else {
-                    1
+                    20
                 }
             }
+            Self::OP_OP => 1,
             Self::OP_OP_IMM | Self::OP_LUI | Self::OP_AUIPC => 1,
             Self::OP_BRANCH => {
                 if matches!(result, StepResult::PcUpdated) {
@@ -578,7 +633,7 @@ impl Machine for RiscV32IntegerMachine {
     fn step(&mut self) -> StepResult {
         self.clear_pending_fault();
         let pc = self.registers.pc;
-        let instruction = self.load_u32(pc);
+        let instruction = self.fetch_instruction_u32(pc);
         if let Some(code) = self.take_pending_fault() {
             return StepResult::Halt(code);
         }
