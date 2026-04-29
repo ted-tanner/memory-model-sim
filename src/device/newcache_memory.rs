@@ -8,9 +8,14 @@ use crate::device::cache_trace::{
 use super::memory::{CacheTiming, InvalidationListener, MemoryDevice};
 use super::secdcp_memory::{SecurityClass, SecurityClassControl};
 
+const DEFAULT_LOGICAL_INDEX_MULTIPLIER: usize = 8;
+
 #[derive(Clone)]
 struct CacheLine {
     base_addr: usize,
+    logical_index: usize,
+    logical_tag: usize,
+    rmt_id: u32,
     data: Box<[u8]>,
     dirty: bool,
     last_used: usize,
@@ -19,16 +24,12 @@ struct CacheLine {
     owner_domain: u32,
 }
 
-#[derive(Default)]
-struct DomainState {
-    mapping: BTreeMap<usize, usize>,
-}
-
 pub struct NewCacheMemory<'a> {
     line_size: usize,
     total_lines: usize,
+    logical_line_count: usize,
     cache: RefCell<Box<[Option<CacheLine>]>>,
-    domains: RefCell<[DomainState; 2]>,
+    rmt: RefCell<BTreeMap<(u32, usize), usize>>,
     active_domain: RefCell<SecurityClass>,
     requester_pid: RefCell<u32>,
     requester_domain_id: RefCell<u32>,
@@ -51,6 +52,9 @@ impl<'a> NewCacheMemory<'a> {
         debug_assert!(num_sets > 0, "NewCache num_sets must be > 0");
         debug_assert!(associativity > 0, "NewCache associativity must be > 0");
         let total_lines = num_sets * associativity;
+        // Newcache indexes a larger logical direct-mapped cache, then maps
+        // resident logical lines onto the smaller physical cache via LNregs.
+        let logical_line_count = total_lines * DEFAULT_LOGICAL_INDEX_MULTIPLIER;
         let cache = (0..total_lines)
             .map(|_| None)
             .collect::<Vec<_>>()
@@ -58,8 +62,9 @@ impl<'a> NewCacheMemory<'a> {
         Self {
             line_size,
             total_lines,
+            logical_line_count,
             cache: RefCell::new(cache),
-            domains: RefCell::new([DomainState::default(), DomainState::default()]),
+            rmt: RefCell::new(BTreeMap::new()),
             active_domain: RefCell::new(SecurityClass::High),
             requester_pid: RefCell::new(0),
             requester_domain_id: RefCell::new(0),
@@ -70,6 +75,11 @@ impl<'a> NewCacheMemory<'a> {
             timing: CacheTiming::default(),
             trace: None,
         }
+    }
+
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        *self.rng_state.get_mut() = seed.max(1);
+        self
     }
 
     pub fn with_clock(mut self, clock: Rc<Clock>) -> Self {
@@ -87,19 +97,32 @@ impl<'a> NewCacheMemory<'a> {
         self
     }
 
-    fn domain_index(domain: SecurityClass) -> usize {
-        match domain {
-            SecurityClass::High => 0,
-            SecurityClass::Low => 1,
-        }
-    }
-
     fn active_domain(&self) -> SecurityClass {
         *self.active_domain.borrow()
     }
 
+    fn active_rmt_id(&self) -> u32 {
+        let domain_id = *self.requester_domain_id.borrow();
+        if domain_id != 0 {
+            domain_id
+        } else {
+            match self.active_domain() {
+                SecurityClass::High => 0,
+                SecurityClass::Low => 1,
+            }
+        }
+    }
+
     fn line_base(&self, addr: usize) -> usize {
         (addr / self.line_size) * self.line_size
+    }
+
+    fn logical_index_and_tag(&self, base_addr: usize) -> (usize, usize) {
+        let line_number = base_addr / self.line_size;
+        (
+            line_number % self.logical_line_count,
+            line_number / self.logical_line_count,
+        )
     }
 
     fn next_use_counter(&self) -> usize {
@@ -129,12 +152,16 @@ impl<'a> NewCacheMemory<'a> {
     }
 
     fn fill_line_from_backing(&self, base_addr: usize, owner: SecurityClass) -> CacheLine {
+        let (logical_index, logical_tag) = self.logical_index_and_tag(base_addr);
         let mut data = vec![0u8; self.line_size].into_boxed_slice();
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = self.backing_memory.load_u8(base_addr + i);
         }
         CacheLine {
             base_addr,
+            logical_index,
+            logical_tag,
+            rmt_id: self.active_rmt_id(),
             data,
             dirty: false,
             last_used: self.next_use_counter(),
@@ -150,27 +177,25 @@ impl<'a> NewCacheMemory<'a> {
         }
     }
 
-    fn lookup_active_line(&self, base_addr: usize) -> Option<usize> {
-        let owner = self.active_domain();
-        let owner_idx = Self::domain_index(owner);
+    fn lookup_active_index(&self, base_addr: usize) -> Option<usize> {
+        let rmt_id = self.active_rmt_id();
+        let (logical_index, _) = self.logical_index_and_tag(base_addr);
         let mapped_idx = {
-            let domains = self.domains.borrow();
-            domains[owner_idx].mapping.get(&base_addr).copied()
+            let rmt = self.rmt.borrow();
+            rmt.get(&(rmt_id, logical_index)).copied()
         }?;
 
-        let is_hit = {
+        let is_valid_index_match = {
             let cache = self.cache.borrow();
             cache[mapped_idx]
                 .as_ref()
-                .is_some_and(|line| line.owner == owner && line.base_addr == base_addr)
+                .is_some_and(|line| line.rmt_id == rmt_id && line.logical_index == logical_index)
         };
 
-        if is_hit {
+        if is_valid_index_match {
             Some(mapped_idx)
         } else {
-            self.domains.borrow_mut()[owner_idx]
-                .mapping
-                .remove(&base_addr);
+            self.rmt.borrow_mut().remove(&(rmt_id, logical_index));
             None
         }
     }
@@ -200,20 +225,18 @@ impl<'a> NewCacheMemory<'a> {
         };
 
         if let Some(old_line) = evicted.as_ref() {
-            let owner_idx = Self::domain_index(old_line.owner);
-            self.domains.borrow_mut()[owner_idx]
-                .mapping
-                .remove(&old_line.base_addr);
+            self.rmt
+                .borrow_mut()
+                .remove(&(old_line.rmt_id, old_line.logical_index));
             if old_line.dirty {
                 self.write_back_line(old_line);
                 self.tick(self.timing.write_back);
             }
         }
 
-        let owner_idx = Self::domain_index(line.owner);
-        self.domains.borrow_mut()[owner_idx]
-            .mapping
-            .insert(line.base_addr, idx);
+        self.rmt
+            .borrow_mut()
+            .insert((line.rmt_id, line.logical_index), idx);
         evicted
     }
 
@@ -255,24 +278,51 @@ impl<'a> NewCacheMemory<'a> {
         let base_addr = self.line_base(addr);
         let offset = addr - base_addr;
 
-        if let Some(idx) = self.lookup_active_line(base_addr) {
-            let use_count = self.next_use_counter();
-            let byte = {
-                let mut cache = self.cache.borrow_mut();
-                let line = cache[idx].as_mut().unwrap();
-                line.last_used = use_count;
-                line.data[offset]
+        if let Some(idx) = self.lookup_active_index(base_addr) {
+            let (_, logical_tag) = self.logical_index_and_tag(base_addr);
+            let is_tag_hit = {
+                let cache = self.cache.borrow();
+                cache[idx]
+                    .as_ref()
+                    .is_some_and(|line| line.logical_tag == logical_tag)
             };
+
+            if is_tag_hit {
+                let use_count = self.next_use_counter();
+                let byte = {
+                    let mut cache = self.cache.borrow_mut();
+                    let line = cache[idx].as_mut().unwrap();
+                    line.last_used = use_count;
+                    line.data[offset]
+                };
+                if charge_access_timing {
+                    self.tick(self.timing.load_hit);
+                }
+                self.record_access(
+                    self.active_domain(),
+                    CacheAccessKind::Load,
+                    addr,
+                    true,
+                    Some(idx),
+                    None,
+                );
+                return byte;
+            }
+
+            let owner = self.active_domain();
+            let line = self.fill_line_from_backing(base_addr, owner);
+            let byte = line.data[offset];
+            let evicted = self.install_line(idx, line);
             if charge_access_timing {
-                self.tick(self.timing.load_hit);
+                self.tick(self.timing.load_miss);
             }
             self.record_access(
-                self.active_domain(),
+                owner,
                 CacheAccessKind::Load,
                 addr,
-                true,
+                false,
                 Some(idx),
-                None,
+                evicted.as_ref(),
             );
             return byte;
         }
@@ -300,25 +350,53 @@ impl<'a> NewCacheMemory<'a> {
         let base_addr = self.line_base(addr);
         let offset = addr - base_addr;
 
-        if let Some(idx) = self.lookup_active_line(base_addr) {
-            let use_count = self.next_use_counter();
-            {
-                let mut cache = self.cache.borrow_mut();
-                let line = cache[idx].as_mut().unwrap();
-                line.last_used = use_count;
-                line.dirty = true;
-                line.data[offset] = value;
+        if let Some(idx) = self.lookup_active_index(base_addr) {
+            let (_, logical_tag) = self.logical_index_and_tag(base_addr);
+            let is_tag_hit = {
+                let cache = self.cache.borrow();
+                cache[idx]
+                    .as_ref()
+                    .is_some_and(|line| line.logical_tag == logical_tag)
+            };
+
+            if is_tag_hit {
+                let use_count = self.next_use_counter();
+                {
+                    let mut cache = self.cache.borrow_mut();
+                    let line = cache[idx].as_mut().unwrap();
+                    line.last_used = use_count;
+                    line.dirty = true;
+                    line.data[offset] = value;
+                }
+                if charge_access_timing {
+                    self.tick(self.timing.store_hit);
+                }
+                self.record_access(
+                    self.active_domain(),
+                    CacheAccessKind::Store,
+                    addr,
+                    true,
+                    Some(idx),
+                    None,
+                );
+                return;
             }
+
+            let owner = self.active_domain();
+            let mut line = self.fill_line_from_backing(base_addr, owner);
+            line.dirty = true;
+            line.data[offset] = value;
+            let evicted = self.install_line(idx, line);
             if charge_access_timing {
-                self.tick(self.timing.store_hit);
+                self.tick(self.timing.store_miss);
             }
             self.record_access(
-                self.active_domain(),
+                owner,
                 CacheAccessKind::Store,
                 addr,
-                true,
+                false,
                 Some(idx),
-                None,
+                evicted.as_ref(),
             );
             return;
         }
@@ -344,11 +422,27 @@ impl<'a> NewCacheMemory<'a> {
 
     #[cfg(test)]
     fn debug_lookup_for(&self, domain: SecurityClass, base_addr: usize) -> Option<usize> {
-        let domains = self.domains.borrow();
-        domains[Self::domain_index(domain)]
-            .mapping
-            .get(&base_addr)
-            .copied()
+        let previous_class = self.active_domain();
+        let previous_domain = *self.requester_domain_id.borrow();
+        *self.active_domain.borrow_mut() = domain;
+        *self.requester_domain_id.borrow_mut() = 0;
+        let rmt_id = self.active_rmt_id();
+        let (logical_index, _) = self.logical_index_and_tag(base_addr);
+        *self.active_domain.borrow_mut() = previous_class;
+        *self.requester_domain_id.borrow_mut() = previous_domain;
+        self.rmt.borrow().get(&(rmt_id, logical_index)).copied()
+    }
+
+    #[cfg(test)]
+    fn debug_lookup_for_rmt(&self, rmt_id: u32, base_addr: usize) -> Option<usize> {
+        let (logical_index, _) = self.logical_index_and_tag(base_addr);
+        self.rmt.borrow().get(&(rmt_id, logical_index)).copied()
+    }
+
+    #[cfg(test)]
+    fn debug_resident_base_for_rmt(&self, rmt_id: u32, base_addr: usize) -> Option<usize> {
+        let idx = self.debug_lookup_for_rmt(rmt_id, base_addr)?;
+        self.cache.borrow()[idx].as_ref().map(|line| line.base_addr)
     }
 }
 
@@ -368,27 +462,34 @@ impl<'a> InvalidationListener for NewCacheMemory<'a> {
     fn invalidate_line(&self, base_addr: usize) {
         let removed = {
             let mut cache = self.cache.borrow_mut();
-            let mut removed = None;
+            let mut removed = Vec::new();
             for slot in cache.iter_mut() {
                 if slot
                     .as_ref()
                     .is_some_and(|line| line.base_addr == base_addr)
+                    && let Some(line) = slot.take()
                 {
-                    removed = slot.take();
-                    break;
+                    removed.push(line);
                 }
             }
             removed
         };
 
-        if let Some(line) = removed {
-            let owner_idx = Self::domain_index(line.owner);
-            self.domains.borrow_mut()[owner_idx]
-                .mapping
-                .remove(&line.base_addr);
-            if line.dirty {
-                self.write_back_line(&line);
-                self.tick(self.timing.write_back);
+        if !removed.is_empty() {
+            let mut writebacks = 0;
+            let mut rmt = self.rmt.borrow_mut();
+            for line in &removed {
+                rmt.remove(&(line.rmt_id, line.logical_index));
+            }
+            drop(rmt);
+            for line in removed {
+                if line.dirty {
+                    self.write_back_line(&line);
+                    writebacks += 1;
+                }
+            }
+            if writebacks > 0 {
+                self.tick(self.timing.write_back * writebacks);
             }
             self.tick(self.timing.invalidation_apply);
         }
@@ -521,6 +622,22 @@ mod tests {
     }
 
     #[test]
+    fn invalidation_removes_all_rmt_copies_of_a_line() {
+        let mem = MainMemory::new(256);
+        let cache = NewCacheMemory::new(16, 1, 4, &mem).with_seed(3);
+
+        cache.set_requester_identity(SecurityClass::Low, 1, 1);
+        let _ = cache.load_u8(0);
+        cache.set_requester_identity(SecurityClass::High, 2, 2);
+        let _ = cache.load_u8(0);
+
+        cache.invalidate_line(0);
+
+        assert!(cache.debug_lookup_for_rmt(1, 0).is_none());
+        assert!(cache.debug_lookup_for_rmt(2, 0).is_none());
+    }
+
+    #[test]
     fn clock_treats_hits_and_misses_like_l1() {
         let clock = Rc::new(Clock::new());
         let mem = MainMemory::new(256)
@@ -545,5 +662,41 @@ mod tests {
         assert_eq!(clock.curr_tick(), 120);
         let _ = cache.load_u8(0);
         assert_eq!(clock.curr_tick(), 124);
+    }
+
+    #[test]
+    fn tag_miss_replaces_the_existing_logical_index() {
+        let mem = MainMemory::new(2048);
+        let cache = NewCacheMemory::new(16, 1, 4, &mem).with_seed(1);
+
+        cache.set_requester_identity(SecurityClass::Low, 1, 7);
+        let _ = cache.load_u8(0);
+        let first_idx = cache.debug_lookup_for_rmt(7, 0).unwrap();
+
+        // With 4 physical lines and an 8x larger LDM, 512 bytes advances
+        // the logical tag while keeping the same logical index.
+        let _ = cache.load_u8(512);
+        let second_idx = cache.debug_lookup_for_rmt(7, 512).unwrap();
+
+        assert_eq!(first_idx, second_idx);
+        assert_eq!(cache.debug_resident_base_for_rmt(7, 0), Some(512));
+    }
+
+    #[test]
+    fn rmt_id_separates_equal_addresses_from_different_domains() {
+        let mem = MainMemory::new(256);
+        let cache = NewCacheMemory::new(16, 1, 4, &mem).with_seed(2);
+
+        cache.set_requester_identity(SecurityClass::Low, 1, 1);
+        let _ = cache.load_u8(0);
+        let rmt1_idx = cache.debug_lookup_for_rmt(1, 0).unwrap();
+
+        cache.set_requester_identity(SecurityClass::High, 2, 2);
+        let _ = cache.load_u8(0);
+        let rmt2_idx = cache.debug_lookup_for_rmt(2, 0).unwrap();
+
+        assert_ne!(rmt1_idx, rmt2_idx);
+        assert_eq!(cache.debug_resident_base_for_rmt(1, 0), Some(0));
+        assert_eq!(cache.debug_resident_base_for_rmt(2, 0), Some(0));
     }
 }

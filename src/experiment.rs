@@ -4,9 +4,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::device::cache_trace::{
-    CacheAccessEvent, CacheAccessKind, CacheAccessSource, CacheTrace,
-};
+use crate::device::cache_trace::{CacheAccessEvent, CacheAccessSource, CacheTrace};
 use crate::device::secdcp_memory::SecurityClass;
 use crate::machine::riscv32_integer::builtins;
 use crate::machine::{
@@ -144,7 +142,6 @@ impl Default for SummaryStats {
 }
 
 struct TrialRecord {
-    trial_id: usize,
     target_set: Option<usize>,
     secret_set: usize,
     secret_bit: Option<u32>,
@@ -152,10 +149,6 @@ struct TrialRecord {
     victim_elapsed_cycles: Option<u64>,
     total_trial_cycles: u64,
     attacker_l1d_evictions_by_victim: u64,
-    probe_l1d_hits: u64,
-    probe_backcache_hits: u64,
-    probe_lower_hits: u64,
-    slice_reassignment_writebacks: u64,
 }
 
 struct XorShift64 {
@@ -237,9 +230,10 @@ pub fn run_experiment(config: &ExperimentConfig) -> io::Result<()> {
     fs::create_dir_all(&config.out_dir)?;
 
     let trace = CacheTrace::new_shared();
-    let mut machine = RiscV32IntegerMachine::with_memory_model_and_trace(
+    let mut machine = RiscV32IntegerMachine::with_memory_model_trace_and_seed(
         config.memory_model,
         Some(trace.clone()),
+        config.seed,
     );
     machine.set_model_instruction_fetch(false);
     let state = Rc::new(RefCell::new(ExperimentBuiltinState::default()));
@@ -247,7 +241,6 @@ pub fn run_experiment(config: &ExperimentConfig) -> io::Result<()> {
     let mut contexts = load_experiment_programs(&mut machine, config)?;
     initialize_contexts(&mut machine, &mut contexts, &state, config);
 
-    let mut trials_file = File::create(config.out_dir.join("trials.jsonl"))?;
     write_config(config)?;
 
     let mut rng = XorShift64::new(config.seed);
@@ -255,7 +248,7 @@ pub fn run_experiment(config: &ExperimentConfig) -> io::Result<()> {
 
     match config.attack {
         AttackKind::BinaryPrimeProbe => {
-            for trial_id in 0..config.trials {
+            for _ in 0..config.trials {
                 let secret_bit = if config.control == ControlMode::ForcedEviction {
                     1
                 } else {
@@ -273,17 +266,15 @@ pub fn run_experiment(config: &ExperimentConfig) -> io::Result<()> {
                     &trace,
                     config,
                     PrimeProbeTrial {
-                        trial_id,
                         secret_set,
                         secret_bit: Some(secret_bit),
                     },
                 );
                 update_summary(config, &record, &mut summary);
-                write_trial(&mut trials_file, config, &record)?;
             }
         }
         AttackKind::PrimeProbe => {
-            for trial_id in 0..config.trials {
+            for _ in 0..config.trials {
                 let secret_set = if config.control == ControlMode::ForcedEviction {
                     config.target_set
                 } else {
@@ -296,17 +287,14 @@ pub fn run_experiment(config: &ExperimentConfig) -> io::Result<()> {
                     &trace,
                     config,
                     PrimeProbeTrial {
-                        trial_id,
                         secret_set,
                         secret_bit: None,
                     },
                 );
                 update_summary(config, &record, &mut summary);
-                write_trial(&mut trials_file, config, &record)?;
             }
         }
         AttackKind::EvictTime => {
-            let mut trial_id = 0;
             let trials_per_set = config.trials.max(SETS) / SETS;
             for target_set in 0..SETS {
                 for _ in 0..trials_per_set {
@@ -322,14 +310,11 @@ pub fn run_experiment(config: &ExperimentConfig) -> io::Result<()> {
                         &trace,
                         config,
                         EvictTimeTrial {
-                            trial_id,
                             target_set,
                             secret_set,
                         },
                     );
                     update_summary(config, &record, &mut summary);
-                    write_trial(&mut trials_file, config, &record)?;
-                    trial_id += 1;
                 }
             }
         }
@@ -482,7 +467,6 @@ fn load_experiment_programs(
 }
 
 struct PrimeProbeTrial {
-    trial_id: usize,
     secret_set: usize,
     secret_bit: Option<u32>,
 }
@@ -533,7 +517,6 @@ fn run_prime_probe_trial(
 
     record_from_events(
         RecordEventInput {
-            trial_id: trial.trial_id,
             target_set: Some(config.target_set),
             secret_set: trial.secret_set,
             secret_bit: trial.secret_bit,
@@ -546,7 +529,6 @@ fn run_prime_probe_trial(
 }
 
 struct EvictTimeTrial {
-    trial_id: usize,
     target_set: usize,
     secret_set: usize,
 }
@@ -598,7 +580,6 @@ fn run_evict_time_trial(
 
     record_from_events(
         RecordEventInput {
-            trial_id: trial.trial_id,
             target_set: Some(trial.target_set),
             secret_set: trial.secret_set,
             secret_bit: Some((trial.secret_set == trial.target_set) as u32),
@@ -697,7 +678,6 @@ fn halt_contexts(
 }
 
 struct RecordEventInput {
-    trial_id: usize,
     target_set: Option<usize>,
     secret_set: usize,
     secret_bit: Option<u32>,
@@ -708,10 +688,6 @@ struct RecordEventInput {
 
 fn record_from_events(input: RecordEventInput, events: &[CacheAccessEvent]) -> TrialRecord {
     let mut attacker_l1d_evictions_by_victim = 0;
-    let mut probe_l1d_hits = 0;
-    let mut probe_backcache_hits = 0;
-    let mut probe_lower_hits = 0;
-    let mut slice_reassignment_writebacks = 0;
 
     for event in events {
         if event.requester_pid == 2
@@ -720,23 +696,9 @@ fn record_from_events(input: RecordEventInput, events: &[CacheAccessEvent]) -> T
         {
             attacker_l1d_evictions_by_victim += 1;
         }
-        if event.requester_pid == 1
-            && matches!(event.kind, CacheAccessKind::Load | CacheAccessKind::Store)
-        {
-            match event.source {
-                CacheAccessSource::L1D if event.hit => probe_l1d_hits += 1,
-                CacheAccessSource::BackCache if event.hit => probe_backcache_hits += 1,
-                CacheAccessSource::Lower => probe_lower_hits += 1,
-                _ => {}
-            }
-        }
-        if event.kind == CacheAccessKind::SliceReassign {
-            slice_reassignment_writebacks += event.writebacks;
-        }
     }
 
     TrialRecord {
-        trial_id: input.trial_id,
         target_set: input.target_set,
         secret_set: input.secret_set,
         secret_bit: input.secret_bit,
@@ -744,10 +706,6 @@ fn record_from_events(input: RecordEventInput, events: &[CacheAccessEvent]) -> T
         victim_elapsed_cycles: input.victim_elapsed_cycles,
         total_trial_cycles: input.total_trial_cycles,
         attacker_l1d_evictions_by_victim,
-        probe_l1d_hits,
-        probe_backcache_hits,
-        probe_lower_hits,
-        slice_reassignment_writebacks,
     }
 }
 
@@ -813,53 +771,6 @@ fn add_timing(summary: &mut SummaryStats, touched: bool, value: f64) {
         summary.sum_untouched += value;
         summary.sumsq_untouched += value * value;
     }
-}
-
-fn write_trial(f: &mut File, config: &ExperimentConfig, record: &TrialRecord) -> io::Result<()> {
-    write!(
-        f,
-        "{{\"trial_id\":{},\"architecture\":\"{}\",\"mode\":\"{}\",\"attacker_domain\":{},\"victim_domain\":{},",
-        record.trial_id,
-        memory_model_name(config.memory_model),
-        schedule_name(config.schedule_mode),
-        attacker_domain(config),
-        victim_domain(config)
-    )?;
-    if let Some(target_set) = record.target_set {
-        write!(f, "\"target_set\":{},", target_set)?;
-    } else {
-        write!(f, "\"target_set\":null,")?;
-    }
-    write!(
-        f,
-        "\"secret_set\":{},\"secret_bit\":{},\"probe_time\":[",
-        record.secret_set,
-        record
-            .secret_bit
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "null".to_string())
-    )?;
-    for (idx, value) in record.probe_time.iter().enumerate() {
-        if idx > 0 {
-            write!(f, ",")?;
-        }
-        write!(f, "{value}")?;
-    }
-    write!(
-        f,
-        "],\"victim_elapsed_cycles\":{},\"total_trial_cycles\":{},\"attacker_lines_evicted_by_victim\":{},\"attacker_lines_served_from_L1D\":{},\"attacker_lines_served_from_BackCache\":{},\"attacker_lines_served_from_L2_LLC_DRAM\":{},\"slice_reassignment_writebacks\":{}}}",
-        record
-            .victim_elapsed_cycles
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "null".to_string()),
-        record.total_trial_cycles,
-        record.attacker_l1d_evictions_by_victim,
-        record.probe_l1d_hits,
-        record.probe_backcache_hits,
-        record.probe_lower_hits,
-        record.slice_reassignment_writebacks
-    )?;
-    writeln!(f)
 }
 
 fn write_summary(config: &ExperimentConfig, summary: &SummaryStats) -> io::Result<()> {
@@ -1021,19 +932,6 @@ fn mutual_information<const R: usize, const C: usize>(joint: &[[usize; C]; R]) -
         }
     }
     mi
-}
-
-fn attacker_domain(config: &ExperimentConfig) -> u32 {
-    let _ = config;
-    1
-}
-
-fn victim_domain(config: &ExperimentConfig) -> u32 {
-    if config.domain_mode == DomainMode::Same {
-        1
-    } else {
-        2
-    }
 }
 
 pub fn memory_model_name(model: MemoryModel) -> &'static str {

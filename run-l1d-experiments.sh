@@ -3,7 +3,7 @@ set -e
 
 cd "$(dirname "$0")"
 
-TRIALS="${TRIALS:-65536}"
+TRIALS="${TRIALS:-1000000}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 JOBS="${JOBS:-8}"
 POLL_INTERVAL="${POLL_INTERVAL:-1}"
@@ -66,11 +66,6 @@ backcache-pp-timesliced prime-probe time-sliced backcache different 11 none
 newcache-pp-timesliced prime-probe time-sliced newcache different 11 none
 smtcache-pp-smt-different prime-probe smt smtcache different 11 none
 smtcache-pp-smt-same prime-probe smt smtcache same 11 none
-default-evict-time evict-time time-sliced default different 12 none
-backcache-evict-time evict-time time-sliced backcache different 12 none
-newcache-evict-time evict-time time-sliced newcache different 12 none
-smtcache-evict-time-smt-different evict-time smt smtcache different 12 none
-smtcache-evict-time-smt-same evict-time smt smtcache same 12 none
 control-no-victim binary-pp time-sliced default different 20 no-victim
 control-forced-eviction binary-pp time-sliced default different 21 forced-eviction
 EXPERIMENTS

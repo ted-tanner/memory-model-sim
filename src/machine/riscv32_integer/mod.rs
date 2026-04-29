@@ -254,6 +254,14 @@ impl RiscV32IntegerMachine {
         model: MemoryModel,
         trace: Option<SharedCacheTrace>,
     ) -> Self {
+        Self::with_memory_model_trace_and_seed(model, trace, 0)
+    }
+
+    pub fn with_memory_model_trace_and_seed(
+        model: MemoryModel,
+        trace: Option<SharedCacheTrace>,
+        seed: u64,
+    ) -> Self {
         let memory_size = Self::DEFAULT_MEMORY_SIZE;
         let clock = Rc::new(Clock::new());
 
@@ -320,7 +328,8 @@ impl RiscV32IntegerMachine {
                 let mut newcache_l1 =
                     NewCacheMemory::new(Self::LINE_SIZE, Self::L1_NUM_SETS, Self::L1_WAYS, l2)
                         .with_clock(clock.clone())
-                        .with_timing(Self::L1_TIMING);
+                        .with_timing(Self::L1_TIMING)
+                        .with_seed(seed ^ 0x6e65_7763_6163_6865);
                 if let Some(trace) = trace.clone() {
                     newcache_l1 = newcache_l1.with_trace(trace);
                 }
